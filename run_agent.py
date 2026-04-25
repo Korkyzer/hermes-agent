@@ -1481,6 +1481,11 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        # Watchdog flag: True while a cached AIAgent is reused but the
+        # turn has not yet made a real API call. Cleared in _touch_activity
+        # so the watchdog can distinguish stuck cached turns from
+        # legitimate long turns where iteration is genuinely advancing.
+        self._is_cached_turn: bool = False
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -5488,6 +5493,8 @@ class AIAgent:
         """Update the last-activity timestamp and description (thread-safe)."""
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
+        if getattr(self, "_is_cached_turn", False):
+            self._is_cached_turn = False
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -5550,6 +5557,7 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            "is_cached_turn": getattr(self, "_is_cached_turn", False),
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:

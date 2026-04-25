@@ -794,6 +794,7 @@ _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+_INTERRUPT_REASON_WATCHDOG = "Watchdog kill (stuck turn)"
 
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
@@ -2557,6 +2558,15 @@ class GatewayRunner:
                 running_agent.interrupt(event.text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
+            # Watchdog: an interrupted turn must not be silently
+            # resumed via the AIAgent cache. The cached agent's
+            # _api_call_count would be reset to 0 and the new turn
+            # could re-enter the iteration=0 (cached) loop. Evict so
+            # the next turn rebuilds a fresh agent (#interrupt_orphan).
+            try:
+                self._evict_cached_agent(session_key)
+            except Exception:
+                pass
 
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
@@ -13687,6 +13697,7 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        agent._is_cached_turn = True
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -15607,6 +15618,16 @@ class GatewayRunner:
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
 
+        from gateway.turn_watchdog import (
+            TurnWatchdog,
+            HeartbeatThrottle,
+            audit_log_kill,
+            REASON_CACHE_LOOP,
+            REASON_STALL,
+        )
+        _turn_watchdog = TurnWatchdog()
+        _heartbeat_throttle = HeartbeatThrottle()
+
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
@@ -15615,21 +15636,69 @@ class GatewayRunner:
                 return
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available.
+                _elapsed_secs = time.time() - _notify_start
+                _elapsed_mins = int(_elapsed_secs // 60)
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
+                _summary = {}
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _summary = _agent_ref.get_activity_summary()
                     except Exception:
                         pass
+
+                # Watchdog: kill stuck cached turns BEFORE emitting
+                # any heartbeat so the user sees the kill message,
+                # not another "Still working...".
+                _kill_reason = _turn_watchdog.evaluate(_summary, _elapsed_secs)
+                if _kill_reason and _agent_ref and hasattr(_agent_ref, "interrupt"):
+                    _iter_n = int(_summary.get("api_call_count", 0) or 0)
+                    _iter_max = int(_summary.get("max_iterations", 0) or 0)
+                    _kill_msg = (
+                        f"⛔ Turn killed: stuck at iteration "
+                        f"{_iter_n}/{_iter_max} for {_elapsed_mins} min. "
+                        f"Reason: {_kill_reason}"
+                    )
+                    try:
+                        _agent_ref.interrupt(_INTERRUPT_REASON_WATCHDOG)
+                    except Exception:
+                        pass
+                    try:
+                        self._evict_cached_agent(session_key)
+                    except Exception:
+                        pass
+                    audit_log_kill(
+                        _kill_reason,
+                        turn_id=str(getattr(_agent_ref, "session_id", "") or session_key or ""),
+                        model=str(getattr(_agent_ref, "model", "")),
+                        iteration=_iter_n,
+                        max_iterations=_iter_max,
+                        elapsed_s=_elapsed_secs,
+                        session_key=session_key,
+                    )
+                    try:
+                        await _notify_adapter.send(
+                            source.chat_id,
+                            _kill_msg,
+                            metadata=_status_thread_metadata,
+                        )
+                    except Exception as _ne:
+                        logger.debug("Watchdog kill notification error: %s", _ne)
+                    return  # Stop heartbeats; the turn is being killed.
+
+                # Throttle: skip emit when (iteration, elapsed_bucket)
+                # is unchanged since the previous heartbeat. Avoids
+                # duplicate "Still working..." spam.
+                if not _heartbeat_throttle.should_emit(_summary, _elapsed_secs):
+                    continue
+
+                _status_detail = ""
+                if _summary:
+                    _parts = [f"iteration {_summary.get('api_call_count', 0)}/{_summary.get('max_iterations', 0)}"]
+                    if _summary.get("current_tool"):
+                        _parts.append(f"running: {_summary['current_tool']}")
+                    else:
+                        _parts.append(_summary.get("last_activity_desc", ""))
+                    _status_detail = " — " + ", ".join(_parts)
                 try:
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
