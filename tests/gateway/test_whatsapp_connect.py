@@ -551,3 +551,50 @@ class TestHttpSessionLifecycle:
 
         mock_task.cancel.assert_not_called()
         assert adapter._poll_task is None
+
+
+class TestWhatsAppVoiceMedia:
+    """WhatsApp voice-message metadata and presence behavior."""
+
+    @pytest.mark.asyncio
+    async def test_build_message_event_preserves_audio_mime(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter._dm_policy = "open"
+        adapter._allow_from = set()
+        adapter._group_policy = "open"
+        adapter._group_allow_from = set()
+        adapter._mention_patterns = []
+
+        audio_path = tmp_path / "voice.m4a"
+        audio_path.write_bytes(b"audio")
+
+        event = await adapter._build_message_event({
+            "messageId": "m1",
+            "chatId": "chat-1",
+            "senderId": "user-1",
+            "senderName": "Arthur",
+            "body": "",
+            "hasMedia": True,
+            "mediaType": "audio",
+            "mediaUrls": [str(audio_path)],
+            "mediaTypes": ["audio/mp4"],
+        })
+
+        assert event.message_type.value == "voice"
+        assert event.media_urls == [str(audio_path)]
+        assert event.media_types == ["audio/mp4"]
+
+    @pytest.mark.asyncio
+    async def test_send_recording_indicator_posts_recording_presence(self):
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter._http_session = MagicMock()
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(MagicMock()))
+        adapter._check_managed_bridge_exit = AsyncMock(return_value=None)
+
+        await adapter.send_recording_indicator("chat-1")
+
+        adapter._http_session.post.assert_called_once()
+        payload = adapter._http_session.post.call_args.kwargs["json"]
+        assert payload == {"chatId": "chat-1", "presence": "recording"}

@@ -370,6 +370,7 @@ class TestSendVoiceReply:
     async def test_calls_tts_and_send_voice(self, runner):
         mock_adapter = AsyncMock()
         mock_adapter.send_voice = AsyncMock()
+        mock_adapter.send_recording_indicator = AsyncMock()
         event = _make_event()
         runner.adapters[event.source.platform] = mock_adapter
 
@@ -383,8 +384,34 @@ class TestSendVoiceReply:
             await runner._send_voice_reply(event, "Hello world")
 
         mock_adapter.send_voice.assert_called_once()
+        mock_adapter.send_recording_indicator.assert_called_once()
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
+
+    @pytest.mark.asyncio
+    async def test_splits_long_tts_reply_into_voice_notes(self, runner):
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock()
+        mock_adapter.send_recording_indicator = AsyncMock()
+        event = _make_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        long_text = "Première phrase. " + ("Deuxième phrase très longue. " * 80)
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, long_text)
+
+        assert mock_tts.call_count > 1
+        assert mock_adapter.send_voice.call_count == mock_tts.call_count
+        first_call = mock_adapter.send_voice.call_args_list[0]
+        second_call = mock_adapter.send_voice.call_args_list[1]
+        assert first_call.kwargs.get("reply_to") == "msg42"
+        assert second_call.kwargs.get("reply_to") is None
 
     @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
