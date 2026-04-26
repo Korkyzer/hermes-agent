@@ -14,6 +14,7 @@ auxiliary LLM path).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -41,6 +42,25 @@ _TRAILING_PUNCTUATION = ".!?,;:\u2026"
 # Discord channel/thread names cannot contain control chars; collapse
 # any whitespace run (including newlines, tabs) into a single space.
 _WS_RUN = re.compile(r"\s+")
+
+# Discord mention syntax: <@123>, <@!123>, <@&123>, <#123>.  Same regex
+# chain used by ``DiscordAdapter._auto_create_thread`` to seed the
+# initial thread name — keep them in lockstep so ``looks_like_raw_prompt``
+# works for prompts that contain user/role/channel mentions.
+_DISCORD_MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>")
+
+
+def strip_discord_mentions(content: str) -> str:
+    """Strip ``<@id>``/``<@!id>``/``<@&id>``/``<#id>`` mentions and collapse whitespace.
+
+    Mirrors the normalization in ``DiscordAdapter._auto_create_thread``
+    so the prompt we capture for auto-rename matches the seed used to
+    name the thread.
+    """
+    if not content:
+        return ""
+    cleaned = _DISCORD_MENTION_RE.sub("", content)
+    return _WS_RUN.sub(" ", cleaned).strip()
 
 
 @dataclass(frozen=True)
@@ -204,8 +224,12 @@ async def maybe_auto_rename_thread(
     if title_generator is None:
         from agent.title_generator import generate_title as title_generator  # noqa: PLC0415
 
+    # The default ``generate_title`` round-trips to the auxiliary LLM
+    # synchronously (blocking I/O).  Push it onto a worker thread so we
+    # don't stall the Discord event loop for other gateway events while
+    # the title is being generated.
     try:
-        raw_title = title_generator(user_message, assistant_response)
+        raw_title = await asyncio.to_thread(title_generator, user_message, assistant_response)
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("Discord auto-rename: title generation raised %s", e)
         return None

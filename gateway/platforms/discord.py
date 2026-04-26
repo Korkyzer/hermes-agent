@@ -47,6 +47,7 @@ import re
 from gateway.platforms.discord_thread_rename import (
     load_config_from_env as _load_auto_rename_config,
     maybe_auto_rename_thread,
+    strip_discord_mentions as _strip_discord_mentions,
 )
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from gateway.platforms.base import (
@@ -2899,11 +2900,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # syntax (users / roles / channels) so thread titles don't end up
         # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
         # meaningful to humans glancing at the thread list (#6336).
-        content = (message.content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
+        # Shared with discord_thread_rename so the auto-rename hook
+        # compares apples-to-apples when checking the seeded name.
+        content = _strip_discord_mentions(message.content or "")
         thread_name = content[:80] if content else "Hermes"
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
@@ -3379,15 +3378,21 @@ class DiscordAdapter(BasePlatformAdapter):
         # that Hermes owns (auto-created or already-participated) so we
         # don't accidentally rename arbitrary threads someone happened to
         # @mention us in.
+        #
+        # Apply the same <@id>/<@!id>/<@&id>/<#id> stripping that
+        # _auto_create_thread uses to seed the thread name; otherwise
+        # looks_like_raw_prompt() would diverge for prompts that contain
+        # role/channel/user mentions and we'd skip the rename.
         if (
             self._auto_rename_cfg.enabled
             and is_thread
             and thread_id
             and thread_id in self._threads
             and thread_id not in self._renamed_threads
-            and normalized_content
         ):
-            self._pending_user_messages[thread_id] = normalized_content
+            captured_prompt = _strip_discord_mentions(normalized_content)
+            if captured_prompt:
+                self._pending_user_messages[thread_id] = captured_prompt
 
         # Build source
         source = self.build_source(

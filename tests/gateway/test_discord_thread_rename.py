@@ -21,6 +21,7 @@ from gateway.platforms.discord_thread_rename import (
     looks_like_raw_prompt,
     maybe_auto_rename_thread,
     sanitize_title,
+    strip_discord_mentions,
 )
 
 
@@ -247,6 +248,91 @@ async def test_skips_when_user_or_assistant_message_missing():
     )
     assert result is None
     thread.edit.assert_not_awaited()
+
+
+# --------------------------------------------------------------------------
+# strip_discord_mentions  — must mirror DiscordAdapter._auto_create_thread
+# so the captured prompt matches the seeded thread name.
+# --------------------------------------------------------------------------
+
+
+class TestStripDiscordMentions:
+    def test_strips_user_mention(self):
+        assert strip_discord_mentions("hey <@1234> please help") == "hey please help"
+
+    def test_strips_nick_mention(self):
+        assert strip_discord_mentions("yo <@!9999>") == "yo"
+
+    def test_strips_role_mention(self):
+        assert strip_discord_mentions("ping <@&5550> team") == "ping team"
+
+    def test_strips_channel_mention(self):
+        assert strip_discord_mentions("see <#42> for context") == "see for context"
+
+    def test_strips_mixed_mentions(self):
+        out = strip_discord_mentions("<@1> talk to <@&2> in <#3> about <@!4> thanks")
+        assert out == "talk to in about thanks"
+
+    def test_collapses_whitespace(self):
+        assert strip_discord_mentions("foo\n\n  bar\tbaz") == "foo bar baz"
+
+    def test_empty_input(self):
+        assert strip_discord_mentions("") == ""
+        assert strip_discord_mentions("<@1>") == ""
+
+
+@pytest.mark.asyncio
+async def test_renames_thread_when_prompt_contained_mentions():
+    """Regression: a prompt like '<@&5550> fix the bug' is normalized to
+    'fix the bug' when seeding the thread name; the captured prompt must
+    be normalized the same way so looks_like_raw_prompt matches.
+    """
+    cfg = DiscordAutoRenameConfig(enabled=True)
+    # The thread was auto-created from "fix the bug" (mentions stripped).
+    thread = _fake_thread("fix the bug")
+
+    # The captured prompt has been normalized via strip_discord_mentions
+    # by the adapter before storage; we feed it the cleaned form here.
+    captured = strip_discord_mentions("<@&5550> fix the bug")
+    assert captured == "fix the bug"
+
+    result = await maybe_auto_rename_thread(
+        thread,
+        user_message=captured,
+        assistant_response="On it.",
+        config=cfg,
+        title_generator=lambda u, a: "Fix the broken login",
+    )
+    assert result == "Fix the broken login"
+    thread.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_title_generation_runs_off_event_loop():
+    """generate_title can block on an LLM call — confirm we hand it off
+    to a worker thread via asyncio.to_thread instead of running it
+    inline on the Discord event loop.
+    """
+    import threading
+    cfg = DiscordAutoRenameConfig(enabled=True)
+    thread = _fake_thread("fix the login bug")
+    main_thread_id = threading.get_ident()
+    seen_thread_ids: list[int] = []
+
+    def slow_blocking_generator(_user, _assistant):
+        seen_thread_ids.append(threading.get_ident())
+        return "Fix Login Bug"
+
+    result = await maybe_auto_rename_thread(
+        thread, "fix the login bug", "ok", cfg,
+        title_generator=slow_blocking_generator,
+    )
+
+    assert result == "Fix Login Bug"
+    assert seen_thread_ids, "title_generator was not called"
+    # The generator must have run on a worker thread, not the caller's
+    # (event-loop) thread.
+    assert seen_thread_ids[0] != main_thread_id
 
 
 @pytest.mark.asyncio
