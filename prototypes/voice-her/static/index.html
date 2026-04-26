@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Her Voice</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="voice-panel">
+        <div class="status-row">
+          <span id="connectionStatus" class="status-pill">Déconnecté</span>
+          <span id="latencyStatus" class="latency">Latence: -</span>
+        </div>
+        <button id="micButton" class="mic-button" type="button" aria-label="Activer le micro">
+          <span class="mic-icon"></span>
+        </button>
+        <p id="hint" class="hint">Maintenir une conversation vocale avec Her.</p>
+        <form id="textForm" class="text-form">
+          <input id="textInput" type="text" autocomplete="off" placeholder="Message texte optionnel" />
+          <button type="submit">Envoyer</button>
+        </form>
+      </section>
+      <aside class="transcript" aria-live="polite">
+        <div id="transcriptList"></div>
+      </aside>
+    </main>
+    <script type="module" src="/static/main.js"></script>
+  </body>
+</html>
