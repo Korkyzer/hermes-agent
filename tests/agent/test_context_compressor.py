@@ -782,6 +782,14 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
 
 class TestSummaryPrefixNormalization:
+    def test_summary_prefix_frames_handoff_as_reference_not_request(self):
+        assert "not a new user request" in SUMMARY_PREFIX
+        assert "not active instructions" in SUMMARY_PREFIX
+        assert "Follow the latest real user message after this summary" in SUMMARY_PREFIX
+        assert "resume exactly" not in SUMMARY_PREFIX
+        assert "Respond ONLY" not in SUMMARY_PREFIX
+        assert "## Active Task" not in SUMMARY_PREFIX
+
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")
         assert summary == f"{SUMMARY_PREFIX}\ndid work"
