@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -23,6 +24,30 @@ _TITLE_PROMPT = (
     "following exchange. The title should capture the main topic or intent. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+_WORD_RE = re.compile(r"[\w\u00c0-\u024f]+(?:['’][\w\u00c0-\u024f]+)?", re.UNICODE)
+_DROP_TRAILING = {"keep", "going", "again", "please", "pls"}
+
+
+def _fallback_title_from_prompt(user_message: str) -> Optional[str]:
+    """Deterministic last-resort title when the auxiliary model returns empty content."""
+    words = _WORD_RE.findall(user_message or "")
+    cleaned = []
+    for word in words:
+        lowered = word.lower()
+        if lowered in {"hermes", "asa", "bot"}:
+            continue
+        cleaned.append(word)
+        if len(cleaned) >= 8:
+            break
+    while cleaned and cleaned[-1].lower() in _DROP_TRAILING:
+        cleaned.pop()
+    if not cleaned:
+        return None
+    title = " ".join(cleaned[:8]).strip()
+    if not title:
+        return None
+    return title[:77].rstrip() + ("..." if len(title) > 77 else "")
 
 
 def generate_title(
@@ -53,15 +78,28 @@ def generate_title(
     ]
 
     try:
+        # Some auxiliary providers expose reasoning/thinking models behind
+        # cheap aliases. With too small a completion budget they can finish
+        # with `length` and an empty visible message, which made Discord
+        # thread auto-rename silently skip. Keep the request small, but give
+        # these models enough room to emit the actual title.
         response = call_llm(
             task="title_generation",
             messages=messages,
-            max_tokens=500,
+            max_tokens=2000,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,
         )
-        title = (response.choices[0].message.content or "").strip()
+        choice = response.choices[0]
+        title = (choice.message.content or "").strip()
+        if not title:
+            logger.warning(
+                "Title generation returned empty content: finish_reason=%r model/task=%s",
+                getattr(choice, "finish_reason", None),
+                "title_generation",
+            )
+            title = _fallback_title_from_prompt(user_message) or ""
         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
         title = title.strip('"\'')
         if title.lower().startswith("title:"):

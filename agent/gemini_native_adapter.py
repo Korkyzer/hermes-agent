@@ -834,11 +834,13 @@ class GeminiNativeClient:
         self.close()
 
     def _headers(self) -> Dict[str, str]:
+        # Keep transport identity generic: do not brand Gemini API fallback
+        # requests as Hermes.  Callers may still pass explicit default_headers
+        # if they need provider-specific metadata.
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "x-goog-api-key": self.api_key,
-            "User-Agent": "hermes-agent (gemini-native)",
         }
         headers.update(self._default_headers)
         return headers

@@ -570,6 +570,28 @@ class TestBuildGeminiRequest:
             "role": "model", "parts": [{"text": "hello"}],
         }
 
+    def test_image_url_data_parts_are_preserved_as_inline_data(self):
+        from agent.gemini_cloudcode_adapter import build_gemini_request
+
+        raw = b"fake-png"
+        data_url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        req = build_gemini_request(messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }])
+
+        parts = req["contents"][0]["parts"]
+        assert parts[0] == {"text": "describe"}
+        assert parts[1] == {
+            "inlineData": {
+                "mimeType": "image/png",
+                "data": base64.b64encode(raw).decode("ascii"),
+            }
+        }
+
     def test_system_instruction_separated(self):
         from agent.gemini_cloudcode_adapter import build_gemini_request
 

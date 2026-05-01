@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -22,6 +23,8 @@ from agent.auxiliary_client import (
     _normalize_aux_provider,
     _try_payment_fallback,
     _resolve_auto,
+    _get_task_fallback_specs,
+    _is_capacity_or_rate_error,
 )
 
 
@@ -32,6 +35,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -885,6 +889,123 @@ class TestCallLlmPaymentFallback:
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
+class TestAuxiliaryConfiguredFallbacks:
+    """Configured auxiliary.<task>.fallbacks are used for retryable errors."""
+
+    def test_get_task_fallback_specs_normalizes_strings_and_dicts(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {
+                "fallbacks": [
+                    "gemini",
+                    {"provider": "anthropic", "model": "claude-opus-4-7"},
+                    {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
+                    "",
+                    {},
+                ],
+            },
+        )
+
+        assert _get_task_fallback_specs("vision") == [
+            {"provider": "gemini"},
+            {"provider": "anthropic", "model": "claude-opus-4-7"},
+            {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
+        ]
+
+    @pytest.mark.parametrize("message,status", [
+        ("capacity exhausted", None),
+        ("quota exceeded", None),
+        ("rate limit", 500),
+        ("Too Many Requests", 429),
+    ])
+    def test_capacity_or_rate_errors_are_retryable(self, message, status):
+        err = Exception(message)
+        if status is not None:
+            err.status_code = status
+        assert _is_capacity_or_rate_error(err) is True
+
+    def test_explicit_vision_provider_uses_configured_fallback_on_429(self, monkeypatch):
+        primary_client = MagicMock()
+        rate_err = Exception("capacity exhausted")
+        rate_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        fallback_client = MagicMock()
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        fallback_client.chat.completions.create.return_value = response
+
+        def fake_resolve_vision_provider_client(provider=None, model=None, **kwargs):
+            if provider == "google-gemini-cli":
+                return "google-gemini-cli", primary_client, "gemini-3-flash-preview"
+            if provider == "gemini":
+                return "gemini", fallback_client, "gemini-3-flash-preview"
+            return provider, None, None
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            lambda *args, **kwargs: (
+                "google-gemini-cli", "gemini-3-flash-preview", None, None, None
+            ),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallbacks": [{"provider": "gemini", "model": "gemini-3-flash-preview"}]},
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            fake_resolve_vision_provider_client,
+        )
+
+        result = call_llm(
+            task="vision",
+            messages=[{"role": "user", "content": "describe image"}],
+            max_tokens=32,
+        )
+
+        assert result is response
+        assert primary_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_count == 1
+        assert fallback_client.chat.completions.create.call_args.kwargs["model"] == "gemini-3-flash-preview"
+
+
+class TestAuxiliaryGoogleGeminiCli:
+    """google-gemini-cli can be used as an explicit auxiliary provider."""
+
+    def test_resolve_provider_client_builds_cloudcode_client(self):
+        with patch("hermes_cli.auth.resolve_gemini_oauth_runtime_credentials", return_value={
+            "api_key": "tok",
+            "base_url": "cloudcode-pa://google",
+            "project_id": "proj-123",
+        }):
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                model="gemini-3-flash-preview",
+            )
+
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        assert isinstance(client, GeminiCloudCodeClient)
+        assert client._configured_project_id == "proj-123"
+        assert model == "gemini-3-flash-preview"
+
+    def test_resolve_provider_client_supports_async_cloudcode_client(self):
+        with patch("hermes_cli.auth.resolve_gemini_oauth_runtime_credentials", return_value={
+            "api_key": "tok",
+            "base_url": "cloudcode-pa://google",
+            "project_id": "proj-123",
+        }):
+            client, model = resolve_provider_client(
+                "google-gemini-cli",
+                model="gemini-3-flash-preview",
+                async_mode=True,
+            )
+
+        from agent.gemini_cloudcode_adapter import AsyncGeminiCloudCodeClient
+
+        assert isinstance(client, AsyncGeminiCloudCodeClient)
+        assert model == "gemini-3-flash-preview"
+
+
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
 # ---------------------------------------------------------------------------
@@ -1077,7 +1198,6 @@ class TestKimiTemperatureOmitted:
         "model",
         [
             "anthropic/claude-sonnet-4-6",
-            "gpt-5.4",
             "deepseek-chat",
         ],
     )
@@ -1092,6 +1212,20 @@ class TestKimiTemperatureOmitted:
         )
 
         assert kwargs["temperature"] == 0.3
+
+
+    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5", "o3-mini", "o4-mini"])
+    def test_openai_reasoning_models_omit_temperature(self, model):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider="openrouter",
+            model=model,
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0.3,
+        )
+
+        assert "temperature" not in kwargs
 
     @pytest.mark.parametrize(
         "base_url",

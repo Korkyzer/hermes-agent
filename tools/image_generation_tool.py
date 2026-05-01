@@ -26,8 +26,10 @@ import os
 import datetime
 import threading
 import uuid
-from typing import Any, Dict, Optional, Union
-from urllib.parse import urlencode
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 import fal_client
 
@@ -851,10 +853,97 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
 
+_REFERENCE_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _redact_url_for_error(url: str) -> str:
+    """Return a URL safe for logs/errors by stripping signed query params."""
+    try:
+        parts = urlsplit(url)
+        safe_path = parts.path
+        if len(safe_path) > 80:
+            safe_path = "..." + safe_path[-77:]
+        return f"{parts.scheme}://{parts.netloc}{safe_path}"
+    except Exception:
+        return "[invalid-url]"
+
+
+def _reference_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "cache" / "image_references"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _download_reference_url(url: str) -> str:
+    """Download a remote image reference into Hermes cache and return its path."""
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("reference_image_url must be an http(s) URL")
+
+    safe_url = _redact_url_for_error(url)
+    req = Request(url, headers={"User-Agent": "HermesAgent/1.0 image-reference-fetch"})
+    try:
+        with urlopen(req, timeout=20) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type and not content_type.startswith("image/"):
+                raise ValueError(f"reference URL did not return an image: {content_type}")
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > _REFERENCE_DOWNLOAD_MAX_BYTES:
+                raise ValueError("reference image is too large (>25MB)")
+            data = resp.read(_REFERENCE_DOWNLOAD_MAX_BYTES + 1)
+    except Exception as exc:
+        raise ValueError(f"could not download reference image {safe_url}: {exc}") from exc
+
+    if len(data) > _REFERENCE_DOWNLOAD_MAX_BYTES:
+        raise ValueError("reference image is too large (>25MB)")
+    if not data:
+        raise ValueError(f"reference URL returned no data: {safe_url}")
+
+    ext = "png"
+    if content_type == "image/jpeg":
+        ext = "jpg"
+    elif content_type == "image/webp":
+        ext = "webp"
+    elif content_type == "image/gif":
+        ext = "gif"
+    elif content_type == "image/png":
+        ext = "png"
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = _reference_cache_dir() / f"reference_{ts}_{uuid.uuid4().hex[:8]}.{ext}"
+    path.write_bytes(data)
+    return str(path)
+
+
+def _materialize_reference_inputs(args: Dict[str, Any]) -> tuple[List[str], Optional[str]]:
+    """Normalize local/remote reference args into local image file paths."""
+    references: List[str] = []
+    raw_references = args.get("references") or []
+    if not isinstance(raw_references, list):
+        return [], "references must be a list of image file paths"
+    references.extend(r.strip() for r in raw_references if isinstance(r, str) and r.strip())
+
+    reference_image_path = args.get("reference_image_path")
+    if isinstance(reference_image_path, str) and reference_image_path.strip():
+        references.append(reference_image_path.strip())
+
+    reference_image_url = args.get("reference_image_url")
+    if isinstance(reference_image_url, str) and reference_image_url.strip():
+        try:
+            references.append(_download_reference_url(reference_image_url.strip()))
+        except ValueError as exc:
+            return [], str(exc)
+
+    return references, None
+
+
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
+        "Generate high-quality images from text prompts, optionally conditioned "
+        "on reference images when the active provider supports them. The underlying "
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
@@ -872,6 +961,19 @@ IMAGE_GENERATE_SCHEMA = {
                 "enum": list(VALID_ASPECT_RATIOS),
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
+            },
+            "references": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional local image file paths to use as visual references. Only supported by reference-capable providers such as openai-codex.",
+            },
+            "reference_image_path": {
+                "type": "string",
+                "description": "Optional single local image file path to use as a visual reference.",
+            },
+            "reference_image_url": {
+                "type": "string",
+                "description": "Optional HTTP(S) image URL to download immediately into Hermes cache and use as a visual reference. Signed URLs are not persisted in logs or errors.",
             },
         },
         "required": ["prompt"],
@@ -900,7 +1002,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, references: Optional[List[str]] = None):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -949,8 +1051,20 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
             "error_type": "provider_not_registered",
         })
 
+    if references and not getattr(provider, "supports_references", False):
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Provider '{getattr(provider, 'name', '?')}' does not support reference images",
+            "error_type": "references_unsupported",
+        })
+
     try:
-        result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio)
+        result = provider.generate(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            **({"references": references} if references else {}),
+        )
     except Exception as exc:
         logger.warning(
             "Image gen provider '%s' raised: %s",
@@ -980,9 +1094,15 @@ def _handle_image_generate(args, **kw):
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    references, ref_error = _materialize_reference_inputs(args)
+    if ref_error:
+        return tool_error(ref_error)
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, references)
     if dispatched is not None:
         return dispatched
+
+    if references:
+        return tool_error("Reference images are only supported by plugin image providers such as openai-codex")
 
     return image_generate_tool(
         prompt=prompt,

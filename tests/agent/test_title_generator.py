@@ -52,13 +52,14 @@ class TestGenerateTitle:
             assert len(title) == 80
             assert title.endswith("...")
 
-    def test_returns_none_on_empty_response(self):
+    def test_falls_back_to_prompt_on_empty_response(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = ""
+        mock_response.choices[0].finish_reason = "length"
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert generate_title("question", "answer") is None
+            assert generate_title("gateway shut down again, keep going", "answer") == "gateway shut down"
 
     def test_returns_none_on_exception(self):
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):

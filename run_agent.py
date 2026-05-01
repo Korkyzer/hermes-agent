@@ -8996,6 +8996,7 @@ class AIAgent:
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
             focus_topic,
         )
+        self._touch_activity("compressing context")
 
         # Notify external memory provider before compression discards context
         if self._memory_manager:

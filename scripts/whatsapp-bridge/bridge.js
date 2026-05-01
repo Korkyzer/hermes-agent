@@ -43,6 +43,7 @@ const WHATSAPP_DEBUG =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const QR_FILE = getArg('qr-file', process.env.WHATSAPP_QR_FILE || path.join(SESSION_DIR, '..', 'current-qr.txt'));
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
@@ -147,6 +148,7 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      try { writeFileSync(QR_FILE, qr, 'utf8'); } catch {}
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');

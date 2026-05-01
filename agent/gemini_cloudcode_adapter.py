@@ -28,6 +28,8 @@ reverse-engineered from the opencode-gemini-auth and clawdbot implementations.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import time
@@ -73,14 +75,57 @@ def _coerce_content_to_text(content: Any) -> str:
         for p in content:
             if isinstance(p, str):
                 pieces.append(p)
-            elif isinstance(p, dict):
-                if p.get("type") == "text" and isinstance(p.get("text"), str):
-                    pieces.append(p["text"])
-                # Multimodal (image_url, etc.) — stub for now; log and skip
-                elif p.get("type") in ("image_url", "input_audio"):
-                    logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
+            elif isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
+                pieces.append(p["text"])
         return "\n".join(pieces)
     return str(content)
+
+
+def _extract_content_parts(content: Any) -> List[Dict[str, Any]]:
+    """Convert OpenAI text/image content parts to Gemini parts.
+
+    Vision tools pass images as data URLs in OpenAI's ``image_url`` format.
+    Code Assist accepts the same Gemini ``inlineData`` parts as the public
+    Gemini API, so keep image bytes instead of silently dropping them.
+    """
+    if not isinstance(content, list):
+        text = _coerce_content_to_text(content)
+        return [{"text": text}] if text else []
+
+    parts: List[Dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                parts.append({"text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        ptype = item.get("type")
+        if ptype == "text":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                parts.append({"text": text})
+            continue
+        if ptype == "image_url":
+            image_url = item.get("image_url") or {}
+            url = image_url.get("url") if isinstance(image_url, dict) else ""
+            if not isinstance(url, str) or not url.startswith("data:"):
+                logger.debug("Dropping non-data image_url part for Code Assist")
+                continue
+            try:
+                header, encoded = url.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                raw = base64.b64decode(encoded)
+            except Exception:
+                logger.debug("Dropping invalid data image_url part for Code Assist", exc_info=True)
+                continue
+            parts.append({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": base64.b64encode(raw).decode("ascii"),
+                }
+            })
+    return parts
 
 
 def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
@@ -155,11 +200,7 @@ def _build_gemini_contents(
             continue
 
         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
-        parts: List[Dict[str, Any]] = []
-
-        text = _coerce_content_to_text(msg.get("content"))
-        if text:
-            parts.append({"text": text})
+        parts: List[Dict[str, Any]] = _extract_content_parts(msg.get("content"))
 
         # Assistant messages can carry tool_calls
         tool_calls = msg.get("tool_calls") or []
@@ -577,9 +618,38 @@ class _GeminiChatCompletions:
         return self._client._create_chat_completion(**kwargs)
 
 
+class _AsyncGeminiChatCompletions:
+    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
+        self._client = client
+
+    async def create(self, **kwargs: Any) -> Any:
+        return await self._client._create_chat_completion(**kwargs)
+
+
 class _GeminiChatNamespace:
     def __init__(self, client: "GeminiCloudCodeClient"):
         self.completions = _GeminiChatCompletions(client)
+
+
+class _AsyncGeminiChatNamespace:
+    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
+        self.completions = _AsyncGeminiChatCompletions(client)
+
+
+class AsyncGeminiCloudCodeClient:
+    """Async facade over GeminiCloudCodeClient using a worker thread."""
+
+    def __init__(self, sync_client: "GeminiCloudCodeClient"):
+        self._sync_client = sync_client
+        self.api_key = sync_client.api_key
+        self.base_url = sync_client.base_url
+        self.chat = _AsyncGeminiChatNamespace(self)
+
+    async def _create_chat_completion(self, **kwargs: Any) -> Any:
+        return await asyncio.to_thread(self._sync_client._create_chat_completion, **kwargs)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._sync_client.close)
 
 
 class GeminiCloudCodeClient:
