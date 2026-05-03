@@ -266,6 +266,22 @@ class TestMessageStorage:
             ).fetchone()
         assert row["content"] == "plain text"
 
+    def test_structured_content_prefix_is_sqlite_text_safe(self, db):
+        db.create_session(session_id="s1", source="cli")
+        content = [{"type": "text", "text": "visible preview"}]
+        db.append_message("s1", role="user", content=content)
+
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT content, length(content) AS content_len "
+                "FROM messages WHERE session_id = ?",
+                ("s1",),
+            ).fetchone()
+
+        assert row["content"].startswith("__json__:")
+        assert "\x00" not in row["content"]
+        assert row["content_len"] == len(row["content"])
+
     def test_replace_messages_handles_multimodal_content(self, db):
         """`replace_messages` (used by /retry, /undo, /compress) must also
         handle list content without crashing."""
@@ -351,6 +367,19 @@ class TestMessageStorage:
 
         conv = db.get_messages_as_conversation("s1")
         assert conv == [{"role": "assistant", "content": "Visible answer"}]
+
+    def test_get_messages_as_conversation_preserves_user_memory_context_text(self, db):
+        db.create_session(session_id="s1", source="cli")
+        content = (
+            "Please document this literal block:\n"
+            "<memory-context>\n"
+            "This is part of the user prompt, not injected memory.\n"
+            "</memory-context>"
+        )
+        db.append_message("s1", role="user", content=content)
+
+        conv = db.get_messages_as_conversation("s1")
+        assert conv == [{"role": "user", "content": content}]
 
     def test_reasoning_persisted_and_restored(self, db):
         """Reasoning text is stored for assistant messages and restored by
@@ -1836,6 +1865,21 @@ class TestListSessionsRich:
         db.append_message("s1", "system", "System prompt")
         sessions = db.list_sessions_rich()
         assert sessions[0]["preview"] == ""
+
+    def test_preview_from_multimodal_user_message_text_part(self, db):
+        db.create_session("s1", "cli")
+        db.append_message(
+            "s1",
+            "user",
+            [
+                {"type": "text", "text": "Describe this screenshot"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            ],
+        )
+
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "Describe this screenshot"
+        assert not sessions[0]["preview"].startswith("__json__:")
 
     def test_last_active_from_latest_message(self, db):
         import time

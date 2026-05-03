@@ -1205,7 +1205,7 @@ class SessionDB:
                 )
                 SELECT s.*,
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT m.content
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -1228,7 +1228,7 @@ class SessionDB:
             query = f"""
                 SELECT s.*,
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT m.content
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -1250,13 +1250,7 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = self._content_preview(s.pop("_preview_raw", ""))
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -1305,10 +1299,10 @@ class SessionDB:
         query = """
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
-                     FROM messages m
-                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                     ORDER BY m.timestamp, m.id LIMIT 1),
+                (SELECT m.content
+                 FROM messages m
+                 WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                 ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
                 COALESCE(
@@ -1324,12 +1318,7 @@ class SessionDB:
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
-        if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
-        else:
-            s["preview"] = ""
+        s["preview"] = self._content_preview(s.pop("_preview_raw", ""))
         return s
 
     # =========================================================================
@@ -1338,9 +1327,10 @@ class SessionDB:
 
     # Sentinel prefix used to distinguish JSON-encoded structured content
     # (multimodal messages: lists of parts like text + image_url) from plain
-    # string content. The NUL byte is not legal in normal text, so this
-    # cannot collide with real user content.
-    _CONTENT_JSON_PREFIX = "\x00json:"
+    # string content. Keep this readable: SQLite string functions treat NUL
+    # bytes as terminators, which breaks previews and length calculations.
+    _CONTENT_JSON_PREFIX = "__json__:"
+    _LEGACY_CONTENT_JSON_PREFIX = "\x00json:"
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
@@ -1367,9 +1357,16 @@ class SessionDB:
     @classmethod
     def _decode_content(cls, content: Any) -> Any:
         """Reverse :meth:`_encode_content`; returns scalars unchanged."""
-        if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
+        if isinstance(content, str) and content.startswith(
+            (cls._CONTENT_JSON_PREFIX, cls._LEGACY_CONTENT_JSON_PREFIX)
+        ):
+            prefix = (
+                cls._CONTENT_JSON_PREFIX
+                if content.startswith(cls._CONTENT_JSON_PREFIX)
+                else cls._LEGACY_CONTENT_JSON_PREFIX
+            )
             try:
-                return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
+                return json.loads(content[len(prefix):])
             except (json.JSONDecodeError, TypeError):
                 logger.warning(
                     "Failed to decode JSON-encoded message content; "
@@ -1377,6 +1374,28 @@ class SessionDB:
                 )
                 return content
         return content
+
+    @classmethod
+    def _content_preview(cls, content: Any, max_chars: int = 60) -> str:
+        """Render stored message content into a compact text preview."""
+        decoded = cls._decode_content(content)
+        if isinstance(decoded, list):
+            parts = [
+                part.get("text", "")
+                for part in decoded
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            text = " ".join(part for part in parts if part)
+        elif isinstance(decoded, dict):
+            text = decoded.get("text") if isinstance(decoded.get("text"), str) else ""
+        elif isinstance(decoded, str):
+            text = decoded
+        else:
+            text = ""
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ""
+        return text[:max_chars] + ("..." if len(text) > max_chars else "")
 
     def append_message(
         self,
@@ -1655,7 +1674,7 @@ class SessionDB:
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            if row["role"] == "assistant" and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
             if row["tool_call_id"]:
