@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -94,10 +94,31 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_search_cache (
+    session_id TEXT PRIMARY KEY,
+    summary TEXT,
+    keywords TEXT,
+    projects TEXT,
+    commands TEXT,
+    last_summarized_at REAL,
+    search_vector TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS search_query_cache (
+    query_hash TEXT PRIMARY KEY,
+    query TEXT,
+    result TEXT,
+    created_at REAL,
+    ttl INTEGER DEFAULT 3600
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_session_search_cache_summarized ON session_search_cache(last_summarized_at);
+CREATE INDEX IF NOT EXISTS idx_search_query_cache_created ON search_query_cache(created_at);
 """
 
 FTS_SQL = """
@@ -105,23 +126,59 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content
 );
 
+CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
+    session_id UNINDEXED,
+    title,
+    content,
+    tokenize='unicode61'
+);
+
 CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
+    INSERT INTO session_search_fts(rowid, session_id, title, content)
+    SELECT
+        new.id,
+        new.session_id,
+        COALESCE(s.title, ''),
+        COALESCE(s.title, '') || ' ' || COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    FROM sessions s
+    WHERE s.id = new.session_id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
+    DELETE FROM session_search_fts WHERE rowid = old.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
+    DELETE FROM session_search_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
+    INSERT INTO session_search_fts(rowid, session_id, title, content)
+    SELECT
+        new.id,
+        new.session_id,
+        COALESCE(s.title, ''),
+        COALESCE(s.title, '') || ' ' || COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
+    FROM sessions s
+    WHERE s.id = new.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_search_title_update AFTER UPDATE OF title ON sessions BEGIN
+    UPDATE session_search_fts
+    SET title = COALESCE(new.title, ''),
+        content = COALESCE(new.title, '') || ' ' || (
+            SELECT COALESCE(m.content, '') || ' ' || COALESCE(m.tool_name, '') || ' ' || COALESCE(m.tool_calls, '')
+            FROM messages m
+            WHERE m.id = session_search_fts.rowid
+        )
+    WHERE session_id = new.id;
 END;
 """
 
@@ -481,6 +538,31 @@ class SessionDB:
                     "COALESCE(tool_calls, '') "
                     "FROM messages"
                 )
+            if current_version < 12:
+                # v12: decouple the searchable session text from the canonical
+                # messages table so session titles and later enriched cache text
+                # can participate in recall without rewriting message content.
+                for _trig in (
+                    "sessions_search_title_update",
+                ):
+                    try:
+                        cursor.execute(f"DROP TRIGGER IF EXISTS {_trig}")
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    cursor.execute("DROP TABLE IF EXISTS session_search_fts")
+                except sqlite3.OperationalError:
+                    pass
+                cursor.executescript(FTS_SQL)
+                cursor.execute(
+                    "INSERT INTO session_search_fts(rowid, session_id, title, content) "
+                    "SELECT m.id, m.session_id, COALESCE(s.title, ''), "
+                    "COALESCE(s.title, '') || ' ' || "
+                    "COALESCE(m.content, '') || ' ' || "
+                    "COALESCE(m.tool_name, '') || ' ' || "
+                    "COALESCE(m.tool_calls, '') "
+                    "FROM messages m JOIN sessions s ON s.id = m.session_id"
+                )
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -501,6 +583,20 @@ class SessionDB:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_SQL)
+
+        try:
+            cursor.execute("SELECT * FROM session_search_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(FTS_SQL)
+            cursor.execute(
+                "INSERT OR IGNORE INTO session_search_fts(rowid, session_id, title, content) "
+                "SELECT m.id, m.session_id, COALESCE(s.title, ''), "
+                "COALESCE(s.title, '') || ' ' || "
+                "COALESCE(m.content, '') || ' ' || "
+                "COALESCE(m.tool_name, '') || ' ' || "
+                "COALESCE(m.tool_calls, '') "
+                "FROM messages m JOIN sessions s ON s.id = m.session_id"
+            )
 
         # Trigram FTS5 for CJK/substring search
         try:
@@ -703,6 +799,89 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_session_search_cache(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the precomputed search summary for a session, if present."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM session_search_cache WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def upsert_session_search_cache(
+        self,
+        session_id: str,
+        summary: str = None,
+        keywords: str = None,
+        projects: str = None,
+        commands: str = None,
+        search_vector: str = None,
+        last_summarized_at: float = None,
+    ) -> None:
+        """Create or update a session-level memory/search cache row."""
+        timestamp = last_summarized_at if last_summarized_at is not None else time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO session_search_cache
+                   (session_id, summary, keywords, projects, commands, last_summarized_at, search_vector)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id) DO UPDATE SET
+                       summary = excluded.summary,
+                       keywords = excluded.keywords,
+                       projects = excluded.projects,
+                       commands = excluded.commands,
+                       last_summarized_at = excluded.last_summarized_at,
+                       search_vector = excluded.search_vector""",
+                (
+                    session_id,
+                    summary,
+                    keywords,
+                    projects,
+                    commands,
+                    timestamp,
+                    search_vector,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_search_query_cache(self, query_hash: str) -> Optional[Dict[str, Any]]:
+        """Return an unexpired cached session_search response by cache key."""
+        now = time.time()
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT * FROM search_query_cache
+                   WHERE query_hash = ?
+                     AND created_at + COALESCE(ttl, 3600) >= ?""",
+                (query_hash, now),
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def set_search_query_cache(
+        self,
+        query_hash: str,
+        query: str,
+        result: str,
+        ttl: int = 3600,
+    ) -> None:
+        """Persist a session_search response for repeated identical queries."""
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO search_query_cache (query_hash, query, result, created_at, ttl)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(query_hash) DO UPDATE SET
+                       query = excluded.query,
+                       result = excluded.result,
+                       created_at = excluded.created_at,
+                       ttl = excluded.ttl""",
+                (query_hash, query, result, time.time(), ttl),
+            )
+
+        self._execute_write(_do)
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -1672,7 +1851,7 @@ class SessionDB:
             return []
 
         # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
+        where_clauses = ["session_search_fts MATCH ?"]
         params: list = [query]
 
         if source_filter is not None:
@@ -1698,15 +1877,16 @@ class SessionDB:
                 m.id,
                 m.session_id,
                 m.role,
-                snippet(messages_fts, 0, '>>>', '<<<', '...', 40) AS snippet,
+                snippet(session_search_fts, 2, '>>>', '<<<', '...', 40) AS snippet,
                 m.content,
                 m.timestamp,
                 m.tool_name,
                 s.source,
                 s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
+                s.started_at AS session_started,
+                s.title
+            FROM session_search_fts
+            JOIN messages m ON m.id = session_search_fts.rowid
             JOIN sessions s ON s.id = m.session_id
             WHERE {where_sql}
             ORDER BY rank
@@ -2222,4 +2402,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-

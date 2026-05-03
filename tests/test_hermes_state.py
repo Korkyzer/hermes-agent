@@ -1409,17 +1409,50 @@ class TestSchemaInit:
         assert "sessions" in tables
         assert "messages" in tables
         assert "schema_version" in tables
+        assert "session_search_cache" in tables
+        assert "search_query_cache" in tables
+        assert "session_search_fts" in tables
 
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == 12
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
         cursor = db._conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
         assert "title" in columns
+
+    def test_search_cache_helpers_round_trip(self, db):
+        db.set_search_query_cache("hash1", "deploy", '{"ok": true}', ttl=3600)
+        row = db.get_search_query_cache("hash1")
+        assert row is not None
+        assert row["query"] == "deploy"
+        assert row["result"] == '{"ok": true}'
+
+    def test_session_search_cache_helpers_round_trip(self, db):
+        db.create_session("s1", "cli")
+        db.upsert_session_search_cache(
+            "s1",
+            summary="Fixed deploy flow",
+            keywords="deploy,railway",
+            projects="buildmap",
+            commands="pytest",
+            search_vector="buildmap deploy pytest",
+        )
+        row = db.get_session_search_cache("s1")
+        assert row is not None
+        assert row["summary"] == "Fixed deploy flow"
+        assert row["projects"] == "buildmap"
+
+    def test_session_title_is_searchable(self, db):
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "Buildmap deployment plan")
+        db.append_message("s1", role="user", content="unrelated body")
+        results = db.search_messages("Buildmap")
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
 
     def test_migration_from_v2(self, tmp_path):
         """Simulate a v2 database and verify migration adds title column."""
@@ -1469,12 +1502,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to the current schema.
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == 12
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2669,7 +2702,6 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == 12
         finally:
             session_db.close()
-
