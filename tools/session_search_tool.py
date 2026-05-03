@@ -16,15 +16,21 @@ Flow:
 """
 
 import asyncio
+import bisect
 import concurrent.futures
+import hashlib
 import json
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
+SUMMARY_TIMEOUT_SECONDS = 25
+QUERY_CACHE_TTL_SECONDS = 3600
+_MEMORY_QUERY_CACHE: Dict[str, tuple[float, str]] = {}
 
 
 def _get_session_search_max_concurrency(default: int = 3) -> int:
@@ -46,6 +52,40 @@ def _get_session_search_max_concurrency(default: int = 3) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, 5))
+
+
+def _query_cache_key(
+    query: str,
+    role_filter: str = None,
+    limit: int = 3,
+    current_session_id: str = None,
+) -> str:
+    payload = {
+        "query": query,
+        "role_filter": role_filter or "",
+        "limit": limit,
+        "current_session_id": current_session_id or "",
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _get_memory_query_cache(cache_key: str) -> Optional[str]:
+    cached = _MEMORY_QUERY_CACHE.get(cache_key)
+    if not cached:
+        return None
+    expires_at, result = cached
+    if expires_at < time.time():
+        _MEMORY_QUERY_CACHE.pop(cache_key, None)
+        return None
+    return result
+
+
+def _set_memory_query_cache(cache_key: str, result: str, ttl: int = QUERY_CACHE_TTL_SECONDS) -> None:
+    _MEMORY_QUERY_CACHE[cache_key] = (time.time() + ttl, result)
+    if len(_MEMORY_QUERY_CACHE) > 128:
+        oldest = min(_MEMORY_QUERY_CACHE.items(), key=lambda item: item[1][0])[0]
+        _MEMORY_QUERY_CACHE.pop(oldest, None)
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -148,11 +188,16 @@ def _truncate_around_matches(
             # Slide through positions of the rarest term and check proximity
             rarest = min(terms, key=lambda t: len(term_positions.get(t, [])))
             for pos in term_positions.get(rarest, []):
-                if all(
-                    any(abs(p - pos) < 200 for p in term_positions.get(t, []))
-                    for t in terms
-                    if t != rarest
-                ):
+                found_all_terms = True
+                for t in terms:
+                    if t == rarest:
+                        continue
+                    positions = term_positions.get(t, [])
+                    idx = bisect.bisect_left(positions, pos - 199)
+                    if idx >= len(positions) or positions[idx] >= pos + 200:
+                        found_all_terms = False
+                        break
+                if found_all_terms:
                     match_positions.append(pos)
 
     # --- 3. Individual term positions (last resort) ---------------------------
@@ -171,15 +216,22 @@ def _truncate_around_matches(
     # --- Pick window that covers the most match positions ---------------------
     match_positions.sort()
 
-    best_start = 0
-    best_count = 0
+    candidate_starts = []
     for candidate in match_positions:
         ws = max(0, candidate - max_chars // 4)  # bias: 25% before, 75% after
-        we = ws + max_chars
-        if we > len(full_text):
+        if ws + max_chars > len(full_text):
             ws = max(0, len(full_text) - max_chars)
-            we = len(full_text)
-        count = sum(1 for p in match_positions if ws <= p < we)
+        candidate_starts.append(ws)
+
+    best_start = candidate_starts[0]
+    best_count = 0
+    right = 0
+    for ws in candidate_starts:
+        we = ws + max_chars
+        while right < len(match_positions) and match_positions[right] < we:
+            right += 1
+        left = bisect.bisect_left(match_positions, ws)
+        count = right - left
         if count > best_count:
             best_count = count
             best_start = ws
@@ -223,14 +275,17 @@ async def _summarize_session(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = await async_call_llm(
-                task="session_search",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                max_tokens=MAX_SUMMARY_TOKENS,
+            response = await asyncio.wait_for(
+                async_call_llm(
+                    task="session_search",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=MAX_SUMMARY_TOKENS,
+                ),
+                timeout=SUMMARY_TIMEOUT_SECONDS,
             )
             content = extract_content_or_reasoning(response)
             if content:
@@ -243,6 +298,9 @@ async def _summarize_session(
             return content
         except RuntimeError:
             logging.warning("No auxiliary model available for session summarization")
+            return None
+        except asyncio.TimeoutError:
+            logging.warning("Session summarization timed out after %s seconds", SUMMARY_TIMEOUT_SECONDS)
             return None
         except Exception as e:
             if attempt < max_retries - 1:
@@ -347,6 +405,17 @@ def session_search(
         return _list_recent_sessions(db, limit, current_session_id)
 
     query = query.strip()
+    cache_key = _query_cache_key(query, role_filter=role_filter, limit=limit, current_session_id=current_session_id)
+    cached_result = _get_memory_query_cache(cache_key)
+    if cached_result:
+        return cached_result
+    try:
+        cache_row = db.get_search_query_cache(cache_key) if hasattr(db, "get_search_query_cache") else None
+        if isinstance(cache_row, dict) and isinstance(cache_row.get("result"), str):
+            _set_memory_query_cache(cache_key, cache_row["result"])
+            return cache_row["result"]
+    except Exception:
+        logging.debug("Failed to read session_search query cache", exc_info=True)
 
     try:
         # Parse role filter
@@ -431,9 +500,24 @@ def session_search(
                 if not messages:
                     continue
                 session_meta = db.get_session(session_id) or {}
+                cached_summary = None
+                try:
+                    row = (
+                        db.get_session_search_cache(session_id)
+                        if hasattr(db, "get_session_search_cache")
+                        else None
+                    )
+                    if isinstance(row, dict) and row.get("summary"):
+                        cached_summary = str(row["summary"])
+                except Exception:
+                    logging.debug(
+                        "Failed to read session summary cache for %s",
+                        session_id,
+                        exc_info=True,
+                    )
                 conversation_text = _format_conversation(messages)
                 conversation_text = _truncate_around_matches(conversation_text, query)
-                tasks.append((session_id, match_info, conversation_text, session_meta))
+                tasks.append((session_id, match_info, conversation_text, session_meta, cached_summary))
             except Exception as e:
                 logging.warning(
                     "Failed to prepare session %s: %s",
@@ -454,7 +538,9 @@ def session_search(
 
             coros = [
                 _bounded_summary(text, meta)
-                for _, _, text, meta in tasks
+                if cached_summary is None
+                else asyncio.sleep(0, result=cached_summary)
+                for _, _, text, meta, cached_summary in tasks
             ]
             return await asyncio.gather(*coros, return_exceptions=True)
 
@@ -478,7 +564,7 @@ def session_search(
             }, ensure_ascii=False)
 
         summaries = []
-        for (session_id, match_info, conversation_text, _), result in zip(tasks, results):
+        for (session_id, match_info, conversation_text, _, cached_summary), result in zip(tasks, results):
             if isinstance(result, Exception):
                 logging.warning(
                     "Failed to summarize session %s: %s",
@@ -495,6 +581,20 @@ def session_search(
 
             if result:
                 entry["summary"] = result
+                if cached_summary is None:
+                    try:
+                        if hasattr(db, "upsert_session_search_cache"):
+                            db.upsert_session_search_cache(
+                                session_id=session_id,
+                                summary=str(result),
+                                search_vector=f"{match_info.get('title') or ''} {result}",
+                            )
+                    except Exception:
+                        logging.debug(
+                            "Failed to write session summary cache for %s",
+                            session_id,
+                            exc_info=True,
+                        )
             else:
                 # Fallback: raw preview so matched sessions aren't silently
                 # dropped when the summarizer is unavailable (fixes #3409).
@@ -503,13 +603,21 @@ def session_search(
 
             summaries.append(entry)
 
-        return json.dumps({
+        response = json.dumps({
             "success": True,
             "query": query,
             "results": summaries,
             "count": len(summaries),
             "sessions_searched": len(seen_sessions),
         }, ensure_ascii=False)
+        if summaries:
+            _set_memory_query_cache(cache_key, response)
+            try:
+                if hasattr(db, "set_search_query_cache"):
+                    db.set_search_query_cache(cache_key, query, response, QUERY_CACHE_TTL_SECONDS)
+            except Exception:
+                logging.debug("Failed to write session_search query cache", exc_info=True)
+        return response
 
     except Exception as e:
         logging.error("Session search failed: %s", e, exc_info=True)
