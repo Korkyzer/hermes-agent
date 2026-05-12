@@ -26,43 +26,13 @@ import os
 import datetime
 import threading
 import uuid
-from typing import Any, Dict, Optional, Union
-from urllib.parse import urlencode
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.error import HTTPError
 
-# fal_client is imported lazily — see _load_fal_client(). Pulling it
-# eagerly added ~64 ms to every CLI cold start because
-# discover_builtin_tools() imports this module unconditionally during
-# the registry walk, even when image generation is never used.
-#
-# Tests that monkeypatch this attribute (e.g.
-# ``monkeypatch.setattr(image_tool, "fal_client", fake_fal_client)``)
-# still work: _load_fal_client() short-circuits when the attribute is
-# anything truthy, so a test-installed mock is not overwritten by a
-# subsequent real import.
-fal_client: Any = None
-
-
-def _load_fal_client() -> Any:
-    """Lazily import fal_client and rebind the module global on first use.
-
-    Idempotent. Returns the (now-loaded) ``fal_client`` module reference.
-    Skips the import if the global is already truthy — this preserves the
-    test pattern of monkeypatching the module global to install a mock.
-    """
-    global fal_client
-    if fal_client is not None:
-        return fal_client
-    try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("image.fal", prompt=False)
-    except ImportError:
-        pass
-    except Exception as e:
-        raise ImportError(str(e))
-    import fal_client as _fal_client  # noqa: F811 — module-global rebind
-    fal_client = _fal_client
-    return fal_client
-
+import fal_client
 
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -371,9 +341,6 @@ class _ManagedFalSyncClient:
     """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
 
     def __init__(self, *, key: str, queue_run_origin: str):
-        # Trigger the lazy import on first construction. Idempotent — the
-        # placeholder is overwritten with the real module on first call.
-        _load_fal_client()
         sync_client_class = getattr(fal_client, "SyncClient", None)
         if sync_client_class is None:
             raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
@@ -471,8 +438,6 @@ def _get_managed_fal_client(managed_gateway):
 
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     """Submit a FAL request using direct credentials or the managed queue gateway."""
-    # Trigger the lazy import on first call. Idempotent.
-    _load_fal_client()
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
@@ -582,7 +547,7 @@ def _build_fal_payload(
     payload: Dict[str, Any] = dict(meta.get("defaults", {}))
     payload["prompt"] = (prompt or "").strip()
 
-    if size_style in {"image_size_preset", "gpt_literal"}:
+    if size_style in ("image_size_preset", "gpt_literal"):
         payload["image_size"] = sizes[aspect]
     elif size_style == "aspect_ratio":
         payload["aspect_ratio"] = sizes[aspect]
@@ -826,11 +791,7 @@ def check_image_generation_requirements() -> bool:
     """
     try:
         if check_fal_api_key():
-            # Trigger the lazy fal_client import here as the SDK presence
-            # check. Raises ImportError if the optional ``fal-client``
-            # package isn't installed; the caller's except ImportError
-            # below catches that and continues to plugin probing.
-            _load_fal_client()
+            fal_client  # noqa: F401 — SDK presence check
             return True
     except ImportError:
         pass
@@ -893,10 +854,137 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
 
+_REFERENCE_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
+
+
+def _redact_url_for_error(url: str) -> str:
+    """Return a URL safe for logs/errors by stripping signed query params."""
+    try:
+        parts = urlsplit(url)
+        safe_path = parts.path
+        if len(safe_path) > 80:
+            safe_path = "..." + safe_path[-77:]
+        return f"{parts.scheme}://{parts.netloc}{safe_path}"
+    except Exception:
+        return "[invalid-url]"
+
+
+def _reference_cache_dir() -> Path:
+    from hermes_constants import get_hermes_home
+
+    path = get_hermes_home() / "cache" / "image_references"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _download_reference_url(url: str) -> str:
+    """Download a remote image reference into Hermes cache and return its path."""
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("reference_image_url must be an http(s) URL")
+
+    # SSRF protection: block requests to private/internal network addresses.
+    # This guards against model-influenced tool arguments that could point at
+    # cloud metadata endpoints (169.254.169.254), localhost services, or
+    # other internal hosts — the same policy used by vision_tools, web_tools,
+    # and browser_tool.
+    from tools.url_safety import is_safe_url as _is_safe_url_url
+    if not _is_safe_url_url(url):
+        raise ValueError(
+            f"reference_image_url blocked by URL safety policy: {_redact_url_for_error(url)}"
+        )
+
+    safe_url = _redact_url_for_error(url)
+
+    # Custom redirect handler that re-validates each target against the URL
+    # safety policy.  Without this, an attacker could host a public URL that
+    # 302-redirects to http://169.254.169.254/ and bypass the pre-flight check.
+    _ssrf_checked = [False]
+
+    class _SSRFSafeRedirectHandler(HTTPRedirectHandler):
+        def redirect_request(  # type: ignore[override]
+            self,
+            req: Request,
+            fp,  # IO[bytes]
+            code: int,
+            msg: str,
+            headers: Any,
+            newurl: str,
+        ) -> Request | None:
+            if not _ssrf_checked[0]:
+                _ssrf_checked[0] = True
+            if not _is_safe_url_url(newurl):
+                logger.warning(
+                    "Blocked redirect to private/internal address in reference fetch: %s",
+                    _redact_url_for_error(newurl),
+                )
+                raise HTTPError(
+                    newurl, code, f"Blocked redirect to private/internal address", headers, fp
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    _opener = build_opener(_SSRFSafeRedirectHandler)
+    req = Request(url, headers={"User-Agent": "HermesAgent/1.0 image-reference-fetch"})
+    try:
+        with _opener.open(req, timeout=20) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type and not content_type.startswith("image/"):
+                raise ValueError(f"reference URL did not return an image: {content_type}")
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > _REFERENCE_DOWNLOAD_MAX_BYTES:
+                raise ValueError("reference image is too large (>25MB)")
+            data = resp.read(_REFERENCE_DOWNLOAD_MAX_BYTES + 1)
+    except Exception as exc:
+        raise ValueError(f"could not download reference image {safe_url}: {exc}") from exc
+
+    if len(data) > _REFERENCE_DOWNLOAD_MAX_BYTES:
+        raise ValueError("reference image is too large (>25MB)")
+    if not data:
+        raise ValueError(f"reference URL returned no data: {safe_url}")
+
+    ext = "png"
+    if content_type == "image/jpeg":
+        ext = "jpg"
+    elif content_type == "image/webp":
+        ext = "webp"
+    elif content_type == "image/gif":
+        ext = "gif"
+    elif content_type == "image/png":
+        ext = "png"
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = _reference_cache_dir() / f"reference_{ts}_{uuid.uuid4().hex[:8]}.{ext}"
+    path.write_bytes(data)
+    return str(path)
+
+
+def _materialize_reference_inputs(args: Dict[str, Any]) -> tuple[List[str], Optional[str]]:
+    """Normalize local/remote reference args into local image file paths."""
+    references: List[str] = []
+    raw_references = args.get("references") or []
+    if not isinstance(raw_references, list):
+        return [], "references must be a list of image file paths"
+    references.extend(r.strip() for r in raw_references if isinstance(r, str) and r.strip())
+
+    reference_image_path = args.get("reference_image_path")
+    if isinstance(reference_image_path, str) and reference_image_path.strip():
+        references.append(reference_image_path.strip())
+
+    reference_image_url = args.get("reference_image_url")
+    if isinstance(reference_image_url, str) and reference_image_url.strip():
+        try:
+            references.append(_download_reference_url(reference_image_url.strip()))
+        except ValueError as exc:
+            return [], str(exc)
+
+    return references, None
+
+
 IMAGE_GENERATE_SCHEMA = {
     "name": "image_generate",
     "description": (
-        "Generate high-quality images from text prompts. The underlying "
+        "Generate high-quality images from text prompts, optionally conditioned "
+        "on reference images when the active provider supports them. The underlying "
         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
         "selectable by the agent. Returns either a URL or an absolute file "
         "path in the `image` field; display it with markdown "
@@ -915,25 +1003,23 @@ IMAGE_GENERATE_SCHEMA = {
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
             },
+            "references": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional local image file paths to use as visual references. Only supported by reference-capable providers such as openai-codex.",
+            },
+            "reference_image_path": {
+                "type": "string",
+                "description": "Optional single local image file path to use as a visual reference.",
+            },
+            "reference_image_url": {
+                "type": "string",
+                "description": "Optional HTTP(S) image URL to download immediately into Hermes cache and use as a visual reference. Signed URLs are not persisted in logs or errors.",
+            },
         },
         "required": ["prompt"],
     },
 }
-
-
-def _read_configured_image_model():
-    """Return the value of ``image_gen.model`` from config.yaml, or None."""
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
-        if isinstance(section, dict):
-            value = section.get("model")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    except Exception as exc:
-        logger.debug("Could not read image_gen.model: %s", exc)
-    return None
 
 
 def _read_configured_image_provider():
@@ -957,7 +1043,7 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, references: Optional[List[str]] = None):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -971,9 +1057,6 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
     configured = _read_configured_image_provider()
     if not configured or configured == "fal":
         return None
-
-    # Also read configured model so we can pass it to the plugin
-    configured_model = _read_configured_image_model()
 
     try:
         # Import locally so plugin discovery isn't triggered just by
@@ -1009,11 +1092,20 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
             "error_type": "provider_not_registered",
         })
 
+    if references and not getattr(provider, "supports_references", False):
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Provider '{getattr(provider, 'name', '?')}' does not support reference images",
+            "error_type": "references_unsupported",
+        })
+
     try:
-        kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
-        if configured_model:
-            kwargs["model"] = configured_model
-        result = provider.generate(**kwargs)
+        result = provider.generate(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            **({"references": references} if references else {}),
+        )
     except Exception as exc:
         logger.warning(
             "Image gen provider '%s' raised: %s",
@@ -1041,11 +1133,50 @@ def _handle_image_generate(args, **kw):
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
 
-    # Route to a plugin-registered provider if one is active (and it's
-    # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    # Early gate: reject reference-based requests before any outbound fetch
+    # when the active provider cannot use them.  This avoids unnecessary
+    # network egress and cache writes for requests guaranteed to fail.
+    _has_reference = bool(
+        args.get("reference_image_url")
+        or args.get("reference_image_path")
+        or args.get("references")
+    )
+    if _has_reference:
+        configured = _read_configured_image_provider()
+        if not configured or configured == "fal":
+            return tool_error(
+                "Reference images are only supported by plugin image providers "
+                "such as openai-codex"
+            )
+        # Plugin provider is set — check if it declares reference support.
+        try:
+            from agent.image_gen_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider = get_provider(configured)
+            if provider is None:
+                _ensure_plugins_discovered(force=True)
+                provider = get_provider(configured)
+            if provider is not None and not getattr(provider, "supports_references", False):
+                return tool_error(
+                    f"Provider '{getattr(provider, 'name', '?')}' does not "
+                    "support reference images"
+                )
+        except Exception:
+            # If we can't determine provider capability, fall through to
+            # materialise — _dispatch_to_plugin_provider will handle errors.
+            pass
+
+    references, ref_error = _materialize_reference_inputs(args)
+    if ref_error:
+        return tool_error(ref_error)
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, references)
     if dispatched is not None:
         return dispatched
+
+    if references:
+        return tool_error("Reference images are only supported by plugin image providers such as openai-codex")
 
     return image_generate_tool(
         prompt=prompt,
