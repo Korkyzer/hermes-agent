@@ -52,13 +52,14 @@ class TestGenerateTitle:
             assert len(title) == 80
             assert title.endswith("...")
 
-    def test_returns_none_on_empty_response(self):
+    def test_falls_back_to_prompt_on_empty_response(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = ""
+        mock_response.choices[0].finish_reason = "length"
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert generate_title("question", "answer") is None
+            assert generate_title("gateway shut down again, keep going", "answer") == "gateway shut down"
 
     def test_returns_none_on_exception(self):
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
@@ -136,21 +137,6 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "hi", "hello")
             db.set_session_title.assert_called_once_with("sess-1", "New Title")
 
-    def test_invokes_title_callback_after_setting_title(self):
-        db = MagicMock()
-        db.get_session_title.return_value = None
-        seen = []
-        with patch("agent.title_generator.generate_title", return_value="Readable Session"):
-            auto_title_session(
-                db,
-                "sess-1",
-                "hello",
-                "hi there",
-                title_callback=seen.append,
-            )
-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
-        assert seen == ["Readable Session"]
-
     def test_skips_if_generation_fails(self):
         db = MagicMock()
         db.get_session_title.return_value = None
@@ -197,13 +183,7 @@ class TestMaybeAutoTitle:
             import time
             time.sleep(0.3)
             mock_auto.assert_called_once_with(
-                db,
-                "sess-1",
-                "hello",
-                "hi there",
-                failure_callback=None,
-                main_runtime=None,
-                title_callback=None,
+                db, "sess-1", "hello", "hi there", failure_callback=None, main_runtime=None
             )
 
     def test_forwards_failure_callback_to_worker(self):
@@ -223,13 +203,7 @@ class TestMaybeAutoTitle:
             import time
             time.sleep(0.3)
             mock_auto.assert_called_once_with(
-                db,
-                "sess-1",
-                "hello",
-                "hi there",
-                failure_callback=_cb,
-                main_runtime=None,
-                title_callback=None,
+                db, "sess-1", "hello", "hi there", failure_callback=_cb, main_runtime=None
             )
 
     def test_skips_if_no_response(self):

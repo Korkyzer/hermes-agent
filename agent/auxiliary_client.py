@@ -132,6 +132,9 @@ _PROVIDER_ALIASES = {
     "google": "gemini",
     "google-gemini": "gemini",
     "google-ai-studio": "gemini",
+    "gemini-cli": "google-gemini-cli",
+    "google-cli": "google-gemini-cli",
+    "google-oauth": "google-gemini-cli",
     "x-ai": "xai",
     "x.ai": "xai",
     "grok": "xai",
@@ -201,6 +204,18 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
     return bare == "trinity-large-thinking"
 
+def _is_openai_reasoning_model(model: Optional[str]) -> bool:
+    """True for OpenAI reasoning models that reject temperature."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if bare.startswith("gpt-"):
+        parts = bare.split("-")
+        if len(parts) >= 2 and parts[1].split(".", 1)[0].isdigit():
+            try:
+                return int(parts[1].split(".", 1)[0]) >= 5
+            except ValueError:
+                return False
+    return bare.startswith(("o1", "o3", "o4"))
+
 
 def _fixed_temperature_for_model(
     model: Optional[str],
@@ -218,6 +233,9 @@ def _fixed_temperature_for_model(
     """
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+        return OMIT_TEMPERATURE
+    if _is_openai_reasoning_model(model):
+        logger.debug("Omitting temperature for OpenAI reasoning model %r", model)
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5
@@ -260,6 +278,7 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 # profiles). New providers should set default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
+    "google-gemini-cli": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
@@ -288,6 +307,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
     "zai": "glm-5v-turbo",
+    "google-gemini-cli": "gemini-3-flash-preview",
 }
 
 # Providers whose endpoint does not accept image input, even though the
@@ -612,11 +632,35 @@ class _CodexCompletionsAdapter:
             content = msg.get("content") or ""
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
-            else:
+                continue
+            # Responses API does not accept role="tool". Convert chat.completions
+            # tool result messages into function_call_output items.
+            if role == "tool":
+                tool_id = msg.get("tool_call_id", "") or ""
+                output_text = content if isinstance(content, str) else str(content)
                 input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
+                    "type": "function_call_output",
+                    "call_id": tool_id,
+                    "output": output_text,
                 })
+                continue
+            # Assistant messages with tool_calls: emit each call as a
+            # function_call item alongside any assistant text.
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    input_msgs.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id", "") or "",
+                        "name": fn.get("name", "") or "",
+                        "arguments": fn.get("arguments", "") or "",
+                    })
+                if not content:
+                    continue
+            input_msgs.append({
+                "role": role,
+                "content": _convert_content_for_responses(content),
+            })
 
         resp_kwargs: Dict[str, Any] = {
             "model": model,
@@ -1444,7 +1488,10 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     # _NOUS_MODEL (google/gemini-3-flash-preview) when the Portal is unreachable
     # or returns a null recommendation for this task type.
     model = _NOUS_MODEL
+    use_portal_recommendation = not (isinstance(nous, dict) and nous.get("source") == "pool")
     try:
+        if not use_portal_recommendation:
+            raise RuntimeError("pool credential uses static auxiliary model")
         from hermes_cli.models import get_nous_recommended_aux_model
         recommended = get_nous_recommended_aux_model(vision=vision)
         if recommended:
@@ -2001,6 +2048,25 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_capacity_or_rate_error(exc: Exception) -> bool:
+    """Detect transient capacity/rate-limit failures that can use fallbacks."""
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+    if status == 429:
+        return True
+    if status in (500, 502, 503, 504):
+        if any(kw in err_lower for kw in (
+            "overloaded", "capacity", "temporarily unavailable",
+            "rate limit", "quota exceeded", "resource exhausted",
+            "too many requests", "try again later",
+        )):
+            return True
+    return any(kw in err_lower for kw in (
+        "rate limit", "too many requests", "overloaded", "capacity exhausted",
+        "temporarily unavailable", "resource exhausted", "quota exceeded",
+    ))
+
+
 def _is_connection_error(exc: Exception) -> bool:
     """Detect connection/network errors that warrant provider fallback.
 
@@ -2393,6 +2459,26 @@ def _refresh_provider_credentials(provider: str) -> bool:
     return False
 
 
+def _get_task_fallback_specs(task: str = None) -> list:
+    """Return normalized auxiliary.<task>.fallbacks entries from config.yaml."""
+    task_config = _get_auxiliary_task_config(task)
+    raw = task_config.get("fallbacks")
+    if not isinstance(raw, list):
+        return []
+    specs = []
+    for entry in raw:
+        if isinstance(entry, str):
+            provider = entry.strip()
+            if provider:
+                specs.append({"provider": provider})
+        elif isinstance(entry, dict):
+            provider = str(entry.get("provider") or "").strip()
+            base_url = str(entry.get("base_url") or "").strip()
+            if provider or base_url:
+                specs.append(dict(entry))
+    return specs
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -2421,6 +2507,43 @@ def _try_payment_fallback(
     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
 
     tried = []
+    for spec in _get_task_fallback_specs(task):
+        provider = str(spec.get("provider") or "auto").strip() or "auto"
+        base_url = str(spec.get("base_url") or "").strip() or None
+        api_key = str(spec.get("api_key") or "").strip() or None
+        api_mode = str(spec.get("api_mode") or "").strip() or None
+        model = str(spec.get("model") or "").strip() or None
+        label = provider if not base_url else f"custom:{base_url}"
+        if _normalize_aux_provider(provider) in skip_chain_labels:
+            continue
+        try:
+            if task == "vision":
+                effective_provider, client, resolved_model = resolve_vision_provider_client(
+                    provider=provider,
+                    model=model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    async_mode=False,
+                )
+                label = effective_provider or label
+            else:
+                client, resolved_model = _get_cached_client(
+                    "custom" if base_url else provider,
+                    model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_mode=api_mode,
+                )
+            if client is not None:
+                logger.info(
+                    "Auxiliary %s: %s on %s - falling back to configured %s (%s)",
+                    task or "call", reason, failed_provider, label, resolved_model or "default",
+                )
+                return client, resolved_model, label
+        except Exception as exc:
+            logger.debug("Auxiliary %s fallback %s unavailable: %s", task or "call", label, exc)
+            tried.append(f"{label} (unavailable)")
+
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
             continue
@@ -4302,7 +4425,7 @@ def call_llm(
 
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        if pool_provider and not _get_task_fallback_specs(task) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
@@ -4355,12 +4478,13 @@ def call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_capacity_or_rate_error(first_err)
         )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in {"auto", "", None}
-        if should_fallback and is_auto:
+        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
             if _is_payment_error(first_err):
                 reason = "payment error"
                 # Resolve the actual provider label (resolved_provider may be
@@ -4651,7 +4775,7 @@ async def async_call_llm(
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        if pool_provider and not _get_task_fallback_specs(task) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
@@ -4687,9 +4811,10 @@ async def async_call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_capacity_or_rate_error(first_err)
         )
         is_auto = resolved_provider in {"auto", "", None}
-        if should_fallback and is_auto:
+        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
             if _is_payment_error(first_err):
                 reason = "payment error"
                 _mark_provider_unhealthy(

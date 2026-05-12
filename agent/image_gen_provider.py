@@ -76,6 +76,17 @@ class ImageGenProvider(abc.ABC):
         """
         return True
 
+    @property
+    def supports_references(self) -> bool:
+        """True when :meth:`generate` accepts a ``references`` kwarg.
+
+        Providers opt in explicitly. The ``image_generate`` dispatcher uses
+        this to forward local image paths only to capable backends and to fail
+        early with ``references_unsupported`` instead of silently dropping
+        reference images.
+        """
+        return False
+
     def list_models(self) -> List[Dict[str, Any]]:
         """Return catalog entries for ``hermes tools`` model picker.
 
@@ -140,6 +151,10 @@ class ImageGenProvider(abc.ABC):
         or :func:`error_response`. ``kwargs`` may contain forward-compat
         parameters future versions of the schema will expose — implementations
         should ignore unknown keys.
+
+        Known optional kwargs:
+        - ``references``: ``list[str]`` of local image file paths, forwarded
+          only when :attr:`supports_references` is True.
         """
 
 

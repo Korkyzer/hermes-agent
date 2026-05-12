@@ -50,6 +50,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 import re
 
+from gateway.platforms.discord_thread_rename import (
+    load_config_from_env as _load_auto_rename_config,
+    maybe_auto_rename_thread,
+    strip_discord_mentions as _strip_discord_mentions,
+)
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from utils import atomic_json_write
 from gateway.platforms.base import (
@@ -565,6 +570,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        self._auto_rename_cfg = _load_auto_rename_config()
+        self._pending_user_messages: Dict[str, str] = {}
+        self._renamed_threads: set[str] = set()
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -1435,6 +1443,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         raise
                 message_ids.append(str(msg.id))
 
+            thread_cls = getattr(discord, "Thread", None) if discord is not None else None
+            if (
+                self._auto_rename_cfg.enabled
+                and message_ids
+                and thread_cls is not None
+                and isinstance(channel, thread_cls)
+            ):
+                self._schedule_thread_auto_rename(channel, content)
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
@@ -1444,6 +1461,37 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _schedule_thread_auto_rename(self, thread: Any, assistant_response: str) -> None:
+        """Fire-and-forget: rename an owned thread after the first assistant reply."""
+        thread_id = str(getattr(thread, "id", "") or "")
+        if not thread_id:
+            return
+        if thread_id in self._renamed_threads:
+            return
+        if thread_id not in self._threads:
+            return
+        user_message = self._pending_user_messages.pop(thread_id, None)
+        if not user_message:
+            return
+
+        cfg = self._auto_rename_cfg
+        renamed_threads = self._renamed_threads
+
+        async def _runner():
+            await maybe_auto_rename_thread(
+                thread,
+                user_message,
+                assistant_response,
+                cfg,
+                is_renamed=lambda: thread_id in renamed_threads,
+                on_renamed=lambda _title: renamed_threads.add(thread_id),
+            )
+
+        try:
+            asyncio.create_task(_runner())
+        except RuntimeError:
+            logger.debug("[%s] No event loop available to auto-rename %s", self.name, thread_id)
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
@@ -4254,6 +4302,17 @@ class DiscordAdapter(BasePlatformAdapter):
         # For threads whose parent is a forum channel, inherit the parent's topic
         # so forum descriptions (e.g. project instructions) appear in the session context.
         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
+
+        if (
+            self._auto_rename_cfg.enabled
+            and is_thread
+            and thread_id
+            and thread_id in self._threads
+            and thread_id not in self._renamed_threads
+        ):
+            captured_prompt = _strip_discord_mentions(normalized_content)
+            if captured_prompt:
+                self._pending_user_messages[thread_id] = captured_prompt
 
         # Build source
         guild = getattr(message, "guild", None)

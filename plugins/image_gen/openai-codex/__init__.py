@@ -15,12 +15,20 @@ Selection precedence for the tier (first hit wins):
 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
 
 Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
+
+Also supports multi-reference input (up to 16 local image paths) via the
+Codex Responses ``input_image`` message content. Callers pass
+``references=[path1, path2, ...]`` and the backend uses them for composition,
+style transfer, and image-to-image edits.
 """
 
 from __future__ import annotations
 
+import base64
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import mimetypes
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -62,6 +70,7 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 }
 
 DEFAULT_MODEL = "gpt-image-2-medium"
+MAX_REFERENCES = 16
 
 _SIZES = {
     "landscape": "1536x1024",
@@ -161,7 +170,55 @@ def _build_codex_client():
         return None
 
 
-def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _load_reference_images(paths: Sequence[Any]) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    """Load local reference images into ``(mime, base64)`` pairs."""
+    loaded: List[Tuple[str, str]] = []
+    for raw in paths:
+        if len(loaded) >= MAX_REFERENCES:
+            break
+        if not isinstance(raw, (str, Path)):
+            return loaded, f"reference path must be a string, got {type(raw).__name__}"
+        path = Path(str(raw)).expanduser()
+        if not path.is_file():
+            return loaded, f"reference not found: {path}"
+        mime, _ = mimetypes.guess_type(path.name)
+        if not mime or not mime.startswith("image/"):
+            mime = "image/png"
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode()
+        except OSError as exc:
+            return loaded, f"could not read reference {path}: {exc}"
+        loaded.append((mime, encoded))
+    return loaded, None
+
+
+def _build_user_content(prompt: str, references: Sequence[Tuple[str, str]]) -> List[Dict[str, Any]]:
+    """Build Responses API user content with optional ``input_image`` items."""
+    if references:
+        labelled = prompt + "\n\n" + "\n".join(
+            f"Reference image {i + 1} is provided below."
+            for i in range(len(references))
+        )
+    else:
+        labelled = prompt
+
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": labelled}]
+    for mime, b64 in references:
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:{mime};base64,{b64}",
+        })
+    return content
+
+
+def _collect_image_b64(
+    client: Any,
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    references: Sequence[Tuple[str, str]] = (),
+) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     image_b64: Optional[str] = None
 
@@ -172,7 +229,7 @@ def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> 
         input=[{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": _build_user_content(prompt, references),
         }],
         tools=[{
             "type": "image_generation",
@@ -229,6 +286,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
     @property
     def display_name(self) -> str:
         return "OpenAI (Codex auth)"
+
+    @property
+    def supports_references(self) -> bool:
+        return True
 
     def is_available(self) -> bool:
         if not _read_codex_access_token():
@@ -307,6 +368,27 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
 
+        raw_refs = kwargs.get("references") or []
+        if not isinstance(raw_refs, (list, tuple)):
+            return error_response(
+                error=f"references must be a list of image paths, got {type(raw_refs).__name__}",
+                error_type="invalid_argument",
+                provider="openai-codex",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+        references, ref_error = _load_reference_images(raw_refs)
+        if ref_error is not None:
+            return error_response(
+                error=ref_error,
+                error_type="invalid_reference",
+                provider="openai-codex",
+                model=tier_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
         client = _build_codex_client()
         if client is None:
             return error_response(
@@ -324,6 +406,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 size=size,
                 quality=meta["quality"],
+                references=references,
             )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
@@ -364,7 +447,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="openai-codex",
-            extra={"size": size, "quality": meta["quality"]},
+            extra={"size": size, "quality": meta["quality"], "references": len(references)},
         )
 
 
