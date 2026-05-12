@@ -172,7 +172,14 @@ class TestPluginDispatch:
                 return b"\x89PNG\r\n\x1a\n"
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setattr(image_generation_tool, "urlopen", lambda req, timeout=20: _Response())
+        from tools.url_safety import is_safe_url
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
+
+        class _MockOpener:
+            def open(self, req, timeout=20):
+                return _Response()
+
+        monkeypatch.setattr(image_generation_tool, "build_opener", lambda *args: _MockOpener())
 
         refs, error = image_generation_tool._materialize_reference_inputs({
             "reference_image_url": "https://cdn.discordapp.com/attachments/a/b/ref.png?ex=secret&hm=secret",

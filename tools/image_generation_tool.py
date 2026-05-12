@@ -29,7 +29,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+from urllib.error import HTTPError
 
 import fal_client
 
@@ -882,10 +883,50 @@ def _download_reference_url(url: str) -> str:
     if parts.scheme not in {"http", "https"} or not parts.netloc:
         raise ValueError("reference_image_url must be an http(s) URL")
 
+    # SSRF protection: block requests to private/internal network addresses.
+    # This guards against model-influenced tool arguments that could point at
+    # cloud metadata endpoints (169.254.169.254), localhost services, or
+    # other internal hosts — the same policy used by vision_tools, web_tools,
+    # and browser_tool.
+    from tools.url_safety import is_safe_url as _is_safe_url_url
+    if not _is_safe_url_url(url):
+        raise ValueError(
+            f"reference_image_url blocked by URL safety policy: {_redact_url_for_error(url)}"
+        )
+
     safe_url = _redact_url_for_error(url)
+
+    # Custom redirect handler that re-validates each target against the URL
+    # safety policy.  Without this, an attacker could host a public URL that
+    # 302-redirects to http://169.254.169.254/ and bypass the pre-flight check.
+    _ssrf_checked = [False]
+
+    class _SSRFSafeRedirectHandler(HTTPRedirectHandler):
+        def redirect_request(  # type: ignore[override]
+            self,
+            req: Request,
+            fp,  # IO[bytes]
+            code: int,
+            msg: str,
+            headers: Any,
+            newurl: str,
+        ) -> Request | None:
+            if not _ssrf_checked[0]:
+                _ssrf_checked[0] = True
+            if not _is_safe_url_url(newurl):
+                logger.warning(
+                    "Blocked redirect to private/internal address in reference fetch: %s",
+                    _redact_url_for_error(newurl),
+                )
+                raise HTTPError(
+                    newurl, code, f"Blocked redirect to private/internal address", headers, fp
+                )
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    _opener = build_opener(_SSRFSafeRedirectHandler)
     req = Request(url, headers={"User-Agent": "HermesAgent/1.0 image-reference-fetch"})
     try:
-        with urlopen(req, timeout=20) as resp:
+        with _opener.open(req, timeout=20) as resp:
             content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             if content_type and not content_type.startswith("image/"):
                 raise ValueError(f"reference URL did not return an image: {content_type}")
