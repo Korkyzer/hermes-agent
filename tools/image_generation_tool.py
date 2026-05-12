@@ -1133,8 +1133,41 @@ def _handle_image_generate(args, **kw):
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
 
-    # Route to a plugin-registered provider if one is active (and it's
-    # not the in-tree FAL path).
+    # Early gate: reject reference-based requests before any outbound fetch
+    # when the active provider cannot use them.  This avoids unnecessary
+    # network egress and cache writes for requests guaranteed to fail.
+    _has_reference = bool(
+        args.get("reference_image_url")
+        or args.get("reference_image_path")
+        or args.get("references")
+    )
+    if _has_reference:
+        configured = _read_configured_image_provider()
+        if not configured or configured == "fal":
+            return tool_error(
+                "Reference images are only supported by plugin image providers "
+                "such as openai-codex"
+            )
+        # Plugin provider is set — check if it declares reference support.
+        try:
+            from agent.image_gen_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider = get_provider(configured)
+            if provider is None:
+                _ensure_plugins_discovered(force=True)
+                provider = get_provider(configured)
+            if provider is not None and not getattr(provider, "supports_references", False):
+                return tool_error(
+                    f"Provider '{getattr(provider, 'name', '?')}' does not "
+                    "support reference images"
+                )
+        except Exception:
+            # If we can't determine provider capability, fall through to
+            # materialise — _dispatch_to_plugin_provider will handle errors.
+            pass
+
     references, ref_error = _materialize_reference_inputs(args)
     if ref_error:
         return tool_error(ref_error)
