@@ -1,0 +1,650 @@
+diff --git a/gateway/platforms/discord_thread_rename.py b/gateway/platforms/discord_thread_rename.py
+new file mode 100644
+index 000000000..050b94fd0
+--- /dev/null
++++ b/gateway/platforms/discord_thread_rename.py
+@@ -0,0 +1,265 @@
++"""Auto-rename Hermes Discord threads with a short, conversation-style title.
++
++When Hermes auto-creates a thread on @mention (or runs inside a thread it
++already participated in), the thread name starts as the raw user prompt
++truncated to 80 chars.  After the first assistant response, this module
++generates a clean 3-8 word title (Claude/ChatGPT style) and renames the
++thread once via Discord's PATCH /channels/{thread_id} endpoint.
++
++Kept deliberately platform-local: the Discord adapter owns the trigger
++and state, so no broader gateway/core change is required.  Title
++generation reuses ``agent.title_generator.generate_title`` (cheap
++auxiliary LLM path).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import re
++from dataclasses import dataclass
++from typing import Any, Awaitable, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++# Discord enforces a 100-char hard limit on channel/thread names.
++DISCORD_MAX_THREAD_NAME = 100
++
++# Default cap for the generated title — keeps thread lists readable.
++DEFAULT_MAX_LENGTH = 60
++
++# Modes for when to fire the rename.  Only one mode is supported today;
++# the field exists so future delays (after_first_user_response, after_n
++# exchanges, ...) slot in without breaking config consumers.
++DELAY_AFTER_FIRST_ASSISTANT_RESPONSE = "after_first_assistant_response"
++
++_VALID_DELAYS = {DELAY_AFTER_FIRST_ASSISTANT_RESPONSE}
++
++# Characters that look noisy in a thread title.
++_TRAILING_PUNCTUATION = ".!?,;:\u2026"
++
++# Discord channel/thread names cannot contain control chars; collapse
++# any whitespace run (including newlines, tabs) into a single space.
++_WS_RUN = re.compile(r"\s+")
++
++# Discord mention syntax: <@123>, <@!123>, <@&123>, <#123>.  Same regex
++# chain used by ``DiscordAdapter._auto_create_thread`` to seed the
++# initial thread name — keep them in lockstep so ``looks_like_raw_prompt``
++# works for prompts that contain user/role/channel mentions.
++_DISCORD_MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>")
++
++
++def strip_discord_mentions(content: str) -> str:
++    """Strip ``<@id>``/``<@!id>``/``<@&id>``/``<#id>`` mentions and collapse whitespace.
++
++    Mirrors the normalization in ``DiscordAdapter._auto_create_thread``
++    so the prompt we capture for auto-rename matches the seed used to
++    name the thread.
++    """
++    if not content:
++        return ""
++    cleaned = _DISCORD_MENTION_RE.sub("", content)
++    return _WS_RUN.sub(" ", cleaned).strip()
++
++
++@dataclass(frozen=True)
++class DiscordAutoRenameConfig:
++    """Resolved config for the auto-rename feature."""
++
++    enabled: bool = False
++    max_length: int = DEFAULT_MAX_LENGTH
++    delay: str = DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    @property
++    def effective_max_length(self) -> int:
++        """Clamp the user-provided cap to Discord's hard limit."""
++        if self.max_length <= 0:
++            return DEFAULT_MAX_LENGTH
++        return min(self.max_length, DISCORD_MAX_THREAD_NAME)
++
++
++def load_config_from_env(env: Optional[dict] = None) -> DiscordAutoRenameConfig:
++    """Build a config from environment variables.
++
++    Env vars (all optional):
++      DISCORD_AUTO_RENAME_THREADS    bool, default ``true``
++      DISCORD_AUTO_RENAME_MAX_LENGTH int,  default ``60``
++      DISCORD_AUTO_RENAME_DELAY      str,  default ``after_first_assistant_response``
++    """
++    src = env if env is not None else os.environ
++
++    raw_enabled = src.get("DISCORD_AUTO_RENAME_THREADS", "true")
++    enabled = str(raw_enabled).strip().lower() in ("1", "true", "yes", "on")
++
++    raw_len = src.get("DISCORD_AUTO_RENAME_MAX_LENGTH", "")
++    try:
++        max_length = int(raw_len) if str(raw_len).strip() else DEFAULT_MAX_LENGTH
++    except ValueError:
++        max_length = DEFAULT_MAX_LENGTH
++
++    raw_delay = (src.get("DISCORD_AUTO_RENAME_DELAY") or DELAY_AFTER_FIRST_ASSISTANT_RESPONSE).strip()
++    delay = raw_delay if raw_delay in _VALID_DELAYS else DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    return DiscordAutoRenameConfig(enabled=enabled, max_length=max_length, delay=delay)
++
++
++def sanitize_title(raw: str, max_length: int = DEFAULT_MAX_LENGTH) -> str:
++    """Clean an LLM-generated title down to a Discord-safe thread name.
++
++    - Strips surrounding quotes/whitespace and a leading "Title:" prefix.
++    - Collapses internal whitespace runs into single spaces.
++    - Trims trailing punctuation.
++    - Truncates to ``max_length`` (clamped to Discord's 100-char limit)
++      on a word boundary when possible, with a trailing ellipsis.
++    Returns ``""`` for empty / unsalvageable input — callers should treat
++    that as "skip rename".
++    """
++    if not raw:
++        return ""
++
++    title = raw.strip().strip("\"'\u201c\u201d\u2018\u2019")
++    if title.lower().startswith("title:"):
++        title = title[6:].strip().strip("\"'\u201c\u201d\u2018\u2019")
++
++    # Collapse all whitespace (incl. newlines) into single spaces.
++    title = _WS_RUN.sub(" ", title).strip()
++
++    # Strip trailing punctuation (a single pass is enough since we
++    # already collapsed whitespace).
++    title = title.rstrip(_TRAILING_PUNCTUATION).strip()
++
++    if not title:
++        return ""
++
++    cap = max(1, min(max_length, DISCORD_MAX_THREAD_NAME))
++    if len(title) <= cap:
++        return title
++
++    # Truncate; prefer a word boundary so we don't chop a word in half.
++    cut = title[: cap - 1]
++    space = cut.rfind(" ")
++    if space >= max(10, cap // 2):
++        cut = cut[:space]
++    return cut.rstrip(_TRAILING_PUNCTUATION + " ") + "\u2026"
++
++
++def looks_like_raw_prompt(current_name: str, original_prompt: str) -> bool:
++    """Heuristic: does ``current_name`` still match the raw user prompt?
++
++    The Discord adapter seeds new threads with the first ~80 chars of the
++    user's mention-stripped message (see ``DiscordAdapter._auto_create_thread``).
++    If the current name still matches that seed, no human/agent has
++    renamed it yet — safe to overwrite.
++    """
++    if not current_name or not original_prompt:
++        return False
++    cur = _WS_RUN.sub(" ", current_name).strip()
++    seed = _WS_RUN.sub(" ", original_prompt).strip()
++    if not cur or not seed:
++        return False
++    if cur == seed:
++        return True
++    # The adapter may have appended an ellipsis when truncating to 80
++    # chars (``thread_name[:77] + "..."``).  Normalise that off.
++    cur_no_ell = cur.rstrip(".\u2026").rstrip()
++    seed_prefix = seed[: len(cur_no_ell)]
++    return bool(cur_no_ell) and cur_no_ell == seed_prefix.strip()
++
++
++async def maybe_auto_rename_thread(
++    thread: Any,
++    user_message: str,
++    assistant_response: str,
++    config: DiscordAutoRenameConfig,
++    *,
++    is_renamed: Callable[[], bool] = lambda: False,
++    on_renamed: Callable[[str], None] = lambda _title: None,
++    title_generator: Optional[Callable[[str, str], Optional[str]]] = None,
++    edit_runner: Optional[Callable[[Any, str], Awaitable[None]]] = None,
++) -> Optional[str]:
++    """Generate a title and rename a Hermes-owned Discord thread.
++
++    Returns the applied title on success, ``None`` if skipped or failed.
++    All failure paths log at WARNING/DEBUG and never raise — the caller
++    (a fire-and-forget background task in the adapter) must keep the
++    user-facing reply uninterrupted.
++
++    Injection points (all optional, real defaults):
++      title_generator(user, assistant) -> Optional[str]
++        Defaults to ``agent.title_generator.generate_title``.
++      edit_runner(thread, name) -> Awaitable[None]
++        Defaults to ``await thread.edit(name=name, reason=...)``.
++    """
++    if not config.enabled:
++        return None
++    if config.delay != DELAY_AFTER_FIRST_ASSISTANT_RESPONSE:
++        # Reserved for future strategies; treat unknown delays as "skip"
++        # rather than silently firing on the wrong trigger.
++        logger.debug("Discord auto-rename: unsupported delay %r, skipping", config.delay)
++        return None
++    if thread is None:
++        return None
++    if not user_message or not assistant_response:
++        return None
++
++    try:
++        if is_renamed():
++            return None
++    except Exception:
++        # is_renamed should never raise; if it does, fail open (skip)
++        # rather than risk a duplicate rename.
++        return None
++
++    current_name = getattr(thread, "name", "") or ""
++    if not looks_like_raw_prompt(current_name, user_message):
++        # User already picked a real name OR a previous run already set
++        # one.  Don't stomp on it.
++        logger.debug(
++            "Discord auto-rename: thread name %r no longer matches raw prompt — skipping",
++            current_name,
++        )
++        return None
++
++    if title_generator is None:
++        from agent.title_generator import generate_title as title_generator  # noqa: PLC0415
++
++    # The default ``generate_title`` round-trips to the auxiliary LLM
++    # synchronously (blocking I/O).  Push it onto a worker thread so we
++    # don't stall the Discord event loop for other gateway events while
++    # the title is being generated.
++    try:
++        raw_title = await asyncio.to_thread(title_generator, user_message, assistant_response)
++    except Exception as e:  # pragma: no cover - defensive
++        logger.debug("Discord auto-rename: title generation raised %s", e)
++        return None
++
++    cleaned = sanitize_title(raw_title or "", config.effective_max_length)
++    if not cleaned:
++        logger.debug("Discord auto-rename: empty title after sanitization, skipping")
++        return None
++    if cleaned == current_name:
++        return None
++
++    if edit_runner is None:
++        async def edit_runner(t: Any, name: str) -> None:
++            await t.edit(name=name, reason="Hermes auto-rename")
++
++    try:
++        await edit_runner(thread, cleaned)
++    except Exception as e:
++        logger.warning(
++            "Discord auto-rename: failed to rename thread %s to %r: %s",
++            getattr(thread, "id", "?"), cleaned, e,
++        )
++        return None
++
++    try:
++        on_renamed(cleaned)
++    except Exception:  # pragma: no cover - defensive
++        pass
++    logger.info(
++        "Discord auto-rename: thread %s renamed to %r",
++        getattr(thread, "id", "?"), cleaned,
++    )
++    return cleaned
+diff --git a/tests/gateway/test_discord_thread_rename.py b/tests/gateway/test_discord_thread_rename.py
+new file mode 100644
+index 000000000..7163c9067
+--- /dev/null
++++ b/tests/gateway/test_discord_thread_rename.py
+@@ -0,0 +1,373 @@
++"""Tests for the Discord thread auto-rename feature.
++
++Covers:
++  * Title sanitization (quotes, punctuation, length, whitespace).
++  * Config gating (env vars, enabled/disabled).
++  * "Looks like raw prompt" detection so user-set names are not stomped.
++  * Discord API failure fallback (no exception, returns None).
++  * Repeat-rename prevention via the ``is_renamed`` callback.
++"""
++
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.platforms.discord_thread_rename import (
++    DEFAULT_MAX_LENGTH,
++    DELAY_AFTER_FIRST_ASSISTANT_RESPONSE,
++    DISCORD_MAX_THREAD_NAME,
++    DiscordAutoRenameConfig,
++    load_config_from_env,
++    looks_like_raw_prompt,
++    maybe_auto_rename_thread,
++    sanitize_title,
++    strip_discord_mentions,
++)
++
++
++# --------------------------------------------------------------------------
++# sanitize_title
++# --------------------------------------------------------------------------
++
++
++class TestSanitizeTitle:
++    def test_strips_quotes_and_punctuation(self):
++        assert sanitize_title('"Auto-renommage des threads Discord."') == \
++            "Auto-renommage des threads Discord"
++
++    def test_strips_title_prefix(self):
++        assert sanitize_title("Title: Refactor login flow") == "Refactor login flow"
++
++    def test_collapses_whitespace_and_newlines(self):
++        assert sanitize_title("Refactor   the\nlogin\tflow") == "Refactor the login flow"
++
++    def test_returns_empty_for_empty_input(self):
++        assert sanitize_title("") == ""
++        assert sanitize_title("   ") == ""
++        assert sanitize_title("...") == ""
++
++    def test_truncates_to_max_length_on_word_boundary(self):
++        title = "This is a long generated title that exceeds the limit by a lot"
++        out = sanitize_title(title, max_length=30)
++        assert len(out) <= 30
++        assert out.endswith("\u2026")
++        assert " " in out  # word boundary cut, not mid-word
++
++    def test_clamps_max_length_to_discord_limit(self):
++        # Even with a huge config cap, never exceed Discord's 100-char limit.
++        long = "x" * 200
++        out = sanitize_title(long, max_length=500)
++        assert len(out) <= DISCORD_MAX_THREAD_NAME
++
++    def test_handles_curly_quotes(self):
++        assert sanitize_title("\u201cFix login bug\u201d") == "Fix login bug"
++
++    def test_returns_short_unchanged(self):
++        assert sanitize_title("Hello world") == "Hello world"
++
++
++# --------------------------------------------------------------------------
++# load_config_from_env
++# --------------------------------------------------------------------------
++
++
++class TestLoadConfig:
++    def test_defaults_enabled(self):
++        cfg = load_config_from_env(env={})
++        assert cfg.enabled is True
++        assert cfg.max_length == DEFAULT_MAX_LENGTH
++        assert cfg.delay == DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    def test_disabled_via_env(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_THREADS": "false"})
++        assert cfg.enabled is False
++
++    def test_max_length_override(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_MAX_LENGTH": "40"})
++        assert cfg.max_length == 40
++
++    def test_invalid_max_length_falls_back(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_MAX_LENGTH": "abc"})
++        assert cfg.max_length == DEFAULT_MAX_LENGTH
++
++    def test_unknown_delay_falls_back_to_default(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_DELAY": "ater_first_yolo"})
++        assert cfg.delay == DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    def test_effective_max_length_clamps_to_discord_limit(self):
++        cfg = DiscordAutoRenameConfig(enabled=True, max_length=500)
++        assert cfg.effective_max_length == DISCORD_MAX_THREAD_NAME
++
++    def test_effective_max_length_replaces_zero_with_default(self):
++        cfg = DiscordAutoRenameConfig(enabled=True, max_length=0)
++        assert cfg.effective_max_length == DEFAULT_MAX_LENGTH
++
++
++# --------------------------------------------------------------------------
++# looks_like_raw_prompt
++# --------------------------------------------------------------------------
++
++
++class TestLooksLikeRawPrompt:
++    def test_exact_match(self):
++        assert looks_like_raw_prompt("hello world", "hello world") is True
++
++    def test_truncated_with_ellipsis(self):
++        prompt = "lorsque l'agent Hermes ouvre un thread dans Discord il le renomme"
++        # adapter does prompt[:77] + "..."
++        seeded = prompt[:77] + "..."
++        assert looks_like_raw_prompt(seeded, prompt) is True
++
++    def test_user_set_name_returns_false(self):
++        assert looks_like_raw_prompt("Customer billing thread", "fix the broken login") is False
++
++    def test_empty_inputs(self):
++        assert looks_like_raw_prompt("", "anything") is False
++        assert looks_like_raw_prompt("anything", "") is False
++
++
++# --------------------------------------------------------------------------
++# maybe_auto_rename_thread
++# --------------------------------------------------------------------------
++
++
++def _fake_thread(name: str, edit: AsyncMock | None = None):
++    thread = MagicMock()
++    thread.id = 1234567
++    thread.name = name
++    thread.edit = edit if edit is not None else AsyncMock()
++    return thread
++
++
++@pytest.mark.asyncio
++async def test_renames_thread_on_happy_path():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug please")
++    on_renamed = MagicMock()
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message="fix the login bug please",
++        assistant_response="Sure, looking into it.",
++        config=cfg,
++        on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix the broken login flow",
++    )
++
++    assert result == "Fix the broken login flow"
++    thread.edit.assert_awaited_once()
++    kwargs = thread.edit.await_args.kwargs
++    assert kwargs["name"] == "Fix the broken login flow"
++    assert "reason" in kwargs
++    on_renamed.assert_called_once_with("Fix the broken login flow")
++
++
++@pytest.mark.asyncio
++async def test_skips_when_disabled():
++    cfg = DiscordAutoRenameConfig(enabled=False)
++    thread = _fake_thread("anything")
++
++    result = await maybe_auto_rename_thread(
++        thread, "u", "a", cfg,
++        title_generator=lambda u, a: "Generated",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_already_renamed():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug please")
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug please", "ok", cfg,
++        is_renamed=lambda: True,
++        title_generator=lambda u, a: "Generated Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_thread_name_no_longer_matches_prompt():
++    """User (or another agent) already renamed the thread — leave it alone."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("Customer billing thread")
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message="fix the broken login",
++        assistant_response="ok",
++        config=cfg,
++        title_generator=lambda u, a: "Generated Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_does_not_raise_when_discord_edit_fails():
++    """Forbidden / HTTPException must be swallowed and logged — never bubble."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    edit = AsyncMock(side_effect=RuntimeError("403 Forbidden: missing perms"))
++    thread = _fake_thread("fix the login bug", edit=edit)
++    on_renamed = MagicMock()
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix Login Bug",
++    )
++
++    assert result is None
++    edit.assert_awaited_once()
++    on_renamed.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_title_generator_returns_empty():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        title_generator=lambda u, a: "",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_user_or_assistant_message_missing():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++    result = await maybe_auto_rename_thread(
++        thread, "", "response", cfg,
++        title_generator=lambda u, a: "Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++# --------------------------------------------------------------------------
++# strip_discord_mentions  — must mirror DiscordAdapter._auto_create_thread
++# so the captured prompt matches the seeded thread name.
++# --------------------------------------------------------------------------
++
++
++class TestStripDiscordMentions:
++    def test_strips_user_mention(self):
++        assert strip_discord_mentions("hey <@1234> please help") == "hey please help"
++
++    def test_strips_nick_mention(self):
++        assert strip_discord_mentions("yo <@!9999>") == "yo"
++
++    def test_strips_role_mention(self):
++        assert strip_discord_mentions("ping <@&5550> team") == "ping team"
++
++    def test_strips_channel_mention(self):
++        assert strip_discord_mentions("see <#42> for context") == "see for context"
++
++    def test_strips_mixed_mentions(self):
++        out = strip_discord_mentions("<@1> talk to <@&2> in <#3> about <@!4> thanks")
++        assert out == "talk to in about thanks"
++
++    def test_collapses_whitespace(self):
++        assert strip_discord_mentions("foo\n\n  bar\tbaz") == "foo bar baz"
++
++    def test_empty_input(self):
++        assert strip_discord_mentions("") == ""
++        assert strip_discord_mentions("<@1>") == ""
++
++
++@pytest.mark.asyncio
++async def test_renames_thread_when_prompt_contained_mentions():
++    """Regression: a prompt like '<@&5550> fix the bug' is normalized to
++    'fix the bug' when seeding the thread name; the captured prompt must
++    be normalized the same way so looks_like_raw_prompt matches.
++    """
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    # The thread was auto-created from "fix the bug" (mentions stripped).
++    thread = _fake_thread("fix the bug")
++
++    # The captured prompt has been normalized via strip_discord_mentions
++    # by the adapter before storage; we feed it the cleaned form here.
++    captured = strip_discord_mentions("<@&5550> fix the bug")
++    assert captured == "fix the bug"
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message=captured,
++        assistant_response="On it.",
++        config=cfg,
++        title_generator=lambda u, a: "Fix the broken login",
++    )
++    assert result == "Fix the broken login"
++    thread.edit.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_title_generation_runs_off_event_loop():
++    """generate_title can block on an LLM call — confirm we hand it off
++    to a worker thread via asyncio.to_thread instead of running it
++    inline on the Discord event loop.
++    """
++    import threading
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++    main_thread_id = threading.get_ident()
++    seen_thread_ids: list[int] = []
++
++    def slow_blocking_generator(_user, _assistant):
++        seen_thread_ids.append(threading.get_ident())
++        return "Fix Login Bug"
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        title_generator=slow_blocking_generator,
++    )
++
++    assert result == "Fix Login Bug"
++    assert seen_thread_ids, "title_generator was not called"
++    # The generator must have run on a worker thread, not the caller's
++    # (event-loop) thread.
++    assert seen_thread_ids[0] != main_thread_id
++
++
++@pytest.mark.asyncio
++async def test_marks_renamed_only_after_successful_edit():
++    """on_renamed must fire exactly once after a successful edit, not before."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++
++    renamed_state = {"done": False}
++
++    async def fake_edit(name, reason):
++        # Simulate edit succeeding.
++        return None
++
++    thread = _fake_thread("fix the login bug", edit=AsyncMock(side_effect=fake_edit))
++
++    def is_renamed():
++        return renamed_state["done"]
++
++    def on_renamed(_title):
++        renamed_state["done"] = True
++
++    out1 = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        is_renamed=is_renamed, on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix Login Bug",
++    )
++    assert out1 == "Fix Login Bug"
++    assert renamed_state["done"] is True
++
++    # Second call must short-circuit on is_renamed=True.
++    out2 = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        is_renamed=is_renamed, on_renamed=on_renamed,
++        title_generator=lambda u, a: "Different Title",
++    )
++    assert out2 is None
++    # edit was called only once across both invocations
++    assert thread.edit.await_count == 1

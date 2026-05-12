@@ -1,0 +1,1396 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index df3fdeccc..666ff10c1 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -132,6 +132,9 @@ _PROVIDER_ALIASES = {
+     "google": "gemini",
+     "google-gemini": "gemini",
+     "google-ai-studio": "gemini",
++    "gemini-cli": "google-gemini-cli",
++    "google-cli": "google-gemini-cli",
++    "google-oauth": "google-gemini-cli",
+     "x-ai": "xai",
+     "x.ai": "xai",
+     "grok": "xai",
+@@ -196,6 +199,16 @@ def _is_kimi_model(model: Optional[str]) -> bool:
+     return bare.startswith("kimi-") or bare == "kimi"
+ 
+ 
++def _is_openai_reasoning_model(model: Optional[str]) -> bool:
++    """True for OpenAI reasoning models (GPT-5+, o-series) that reject temperature."""
++    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
++    if bare.startswith("gpt-5") or bare == "gpt-5":
++        return True
++    if bare.startswith("o1") or bare.startswith("o3") or bare.startswith("o4"):
++        return True
++    return False
++
++
+ def _fixed_temperature_for_model(
+     model: Optional[str],
+     base_url: Optional[str] = None,
+@@ -205,7 +218,8 @@ def _fixed_temperature_for_model(
+     Returns:
+         ``OMIT_TEMPERATURE`` — caller must remove the ``temperature`` key so the
+             provider chooses its own default.  Used for all Kimi / Moonshot
+-            models whose gateway selects temperature server-side.
++            models whose gateway selects temperature server-side, and for
++            OpenAI reasoning models (GPT-5+, o-series) which reject temperature.
+         ``float`` — a specific value the caller must use (reserved for future
+             models with fixed-temperature contracts).
+         ``None`` — no override; caller should use its own default.
+@@ -213,11 +227,15 @@ def _fixed_temperature_for_model(
+     if _is_kimi_model(model):
+         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+         return OMIT_TEMPERATURE
++    if _is_openai_reasoning_model(model):
++        logger.debug("Omitting temperature for OpenAI reasoning model %r", model)
++        return OMIT_TEMPERATURE
+     return None
+ 
+ # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
+ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+     "gemini": "gemini-3-flash-preview",
++    "google-gemini-cli": "gemini-3-flash-preview",
+     "zai": "glm-4.5-flash",
+     "kimi-coding": "kimi-k2-turbo-preview",
+     "stepfun": "step-3.5-flash",
+@@ -242,6 +260,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+ _PROVIDER_VISION_MODELS: Dict[str, str] = {
+     "xiaomi": "mimo-v2.5",
+     "zai": "glm-5v-turbo",
++    "google-gemini-cli": "gemini-3-flash-preview",
+ }
+ 
+ # Providers whose endpoint does not accept image input, even though the
+@@ -480,11 +499,35 @@ class _CodexCompletionsAdapter:
+             content = msg.get("content") or ""
+             if role == "system":
+                 instructions = content if isinstance(content, str) else str(content)
+-            else:
++                continue
++            # Responses API does not accept role="tool". Convert chat.completions
++            # tool result messages into function_call_output items.
++            if role == "tool":
++                tool_id = msg.get("tool_call_id", "") or ""
++                output_text = content if isinstance(content, str) else str(content)
+                 input_msgs.append({
+-                    "role": role,
+-                    "content": _convert_content_for_responses(content),
++                    "type": "function_call_output",
++                    "call_id": tool_id,
++                    "output": output_text,
+                 })
++                continue
++            # Assistant messages with tool_calls: emit each call as a
++            # function_call item alongside any assistant text.
++            if role == "assistant" and msg.get("tool_calls"):
++                for tc in msg.get("tool_calls") or []:
++                    fn = tc.get("function") or {}
++                    input_msgs.append({
++                        "type": "function_call",
++                        "call_id": tc.get("id", "") or "",
++                        "name": fn.get("name", "") or "",
++                        "arguments": fn.get("arguments", "") or "",
++                    })
++                if not content:
++                    continue
++            input_msgs.append({
++                "role": role,
++                "content": _convert_content_for_responses(content),
++            })
+ 
+         resp_kwargs: Dict[str, Any] = {
+             "model": model,
+@@ -1614,6 +1657,25 @@ def _is_connection_error(exc: Exception) -> bool:
+     return False
+ 
+ 
++def _is_capacity_or_rate_error(exc: Exception) -> bool:
++    """Detect transient capacity/rate-limit failures that can use fallbacks."""
++    status = getattr(exc, "status_code", None)
++    err_lower = str(exc).lower()
++    if status == 429:
++        return True
++    if status in (500, 502, 503, 504):
++        if any(kw in err_lower for kw in (
++            "overloaded", "capacity", "temporarily unavailable",
++            "rate limit", "quota exceeded", "resource exhausted",
++            "too many requests", "try again later",
++        )):
++            return True
++    return any(kw in err_lower for kw in (
++        "rate limit", "too many requests", "overloaded", "capacity exhausted",
++        "temporarily unavailable", "resource exhausted", "quota exceeded",
++    ))
++
++
+ def _is_auth_error(exc: Exception) -> bool:
+     """Detect auth failures that should trigger provider-specific refresh."""
+     status = getattr(exc, "status_code", None)
+@@ -1728,6 +1790,26 @@ def _refresh_provider_credentials(provider: str) -> bool:
+     return False
+ 
+ 
++def _get_task_fallback_specs(task: str = None) -> list:
++    """Return normalized auxiliary.<task>.fallbacks entries from config.yaml."""
++    task_config = _get_auxiliary_task_config(task)
++    raw = task_config.get("fallbacks")
++    if not isinstance(raw, list):
++        return []
++    specs = []
++    for entry in raw:
++        if isinstance(entry, str):
++            provider = entry.strip()
++            if provider:
++                specs.append({"provider": provider})
++        elif isinstance(entry, dict):
++            provider = str(entry.get("provider") or "").strip()
++            base_url = str(entry.get("base_url") or "").strip()
++            if provider or base_url:
++                specs.append(dict(entry))
++    return specs
++
++
+ def _try_payment_fallback(
+     failed_provider: str,
+     task: str = None,
+@@ -1756,6 +1838,43 @@ def _try_payment_fallback(
+     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
+ 
+     tried = []
++    for spec in _get_task_fallback_specs(task):
++        provider = str(spec.get("provider") or "auto").strip() or "auto"
++        base_url = str(spec.get("base_url") or "").strip() or None
++        api_key = str(spec.get("api_key") or "").strip() or None
++        api_mode = str(spec.get("api_mode") or "").strip() or None
++        model = str(spec.get("model") or "").strip() or None
++        label = provider if not base_url else f"custom:{base_url}"
++        if _normalize_aux_provider(provider) in skip_chain_labels:
++            continue
++        try:
++            if task == "vision":
++                effective_provider, client, resolved_model = resolve_vision_provider_client(
++                    provider=provider,
++                    model=model,
++                    base_url=base_url,
++                    api_key=api_key,
++                    async_mode=False,
++                )
++                label = effective_provider or label
++            else:
++                client, resolved_model = _get_cached_client(
++                    "custom" if base_url else provider,
++                    model,
++                    base_url=base_url,
++                    api_key=api_key,
++                    api_mode=api_mode,
++                )
++            if client is not None:
++                logger.info(
++                    "Auxiliary %s: %s on %s — falling back to configured %s (%s)",
++                    task or "call", reason, failed_provider, label, resolved_model or "default",
++                )
++                return client, resolved_model, label
++        except Exception as exc:
++            logger.debug("Auxiliary %s fallback %s unavailable: %s", task or "call", label, exc)
++        tried.append(label)
++
+     for label, try_fn in _get_provider_chain():
+         if label in skip_chain_labels:
+             continue
+@@ -1898,6 +2017,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
+             return AsyncGeminiNativeClient(sync_client), model
+     except ImportError:
+         pass
++    try:
++        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient, AsyncGeminiCloudCodeClient
++
++        if isinstance(sync_client, GeminiCloudCodeClient):
++            return AsyncGeminiCloudCodeClient(sync_client), model
++    except ImportError:
++        pass
+     try:
+         from agent.copilot_acp_client import CopilotACPClient
+         if isinstance(sync_client, CopilotACPClient):
+@@ -2675,9 +2801,14 @@ def resolve_vision_provider_client(
+         )
+         return _finalize(requested, sync_client, default_model)
+ 
+-    client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+-                                             api_mode=resolved_api_mode,
+-                                             is_vision=True)
++    client, final_model = _get_cached_client(
++        requested,
++        resolved_model,
++        async_mode,
++        api_key=resolved_api_key,
++        api_mode=resolved_api_mode,
++        is_vision=True,
++    )
+     if client is None:
+         return requested, None, None
+     return requested, client, final_model
+@@ -3535,13 +3666,18 @@ def call_llm(
+         # Codex/OAuth tokens that authenticate but whose endpoint is down,
+         # and providers the user never configured that got picked up by
+         # the auto-detection chain.
+-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+-        # Only try alternative providers when the user didn't explicitly
+-        # configure this task's provider.  Explicit provider = hard constraint;
+-        # auto (the default) = best-effort fallback chain.  (#7559)
++        should_fallback = (_is_payment_error(first_err)
++                           or _is_connection_error(first_err)
++                           or _is_capacity_or_rate_error(first_err))
++        # Configured fallback chains are allowed even when the primary provider
++        # was explicit; otherwise only auto mode uses the generic fallback chain.
+         is_auto = resolved_provider in ("auto", "", None)
+-        if should_fallback and is_auto:
+-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
++        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
++            reason = (
++                "payment error" if _is_payment_error(first_err)
++                else "connection error" if _is_connection_error(first_err)
++                else "capacity/rate-limit error"
++            )
+             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+                         task or "call", reason, resolved_provider, first_err)
+             fb_client, fb_model, fb_label = _try_payment_fallback(
+@@ -3814,10 +3950,16 @@ async def async_call_llm(
+                         await retry_client.chat.completions.create(**retry_kwargs), task)
+ 
+         # ── Payment / connection fallback (mirrors sync call_llm) ─────
+-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
++        should_fallback = (_is_payment_error(first_err)
++                           or _is_connection_error(first_err)
++                           or _is_capacity_or_rate_error(first_err))
+         is_auto = resolved_provider in ("auto", "", None)
+-        if should_fallback and is_auto:
+-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
++        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
++            reason = (
++                "payment error" if _is_payment_error(first_err)
++                else "connection error" if _is_connection_error(first_err)
++                else "capacity/rate-limit error"
++            )
+             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
+                         task or "call", reason, resolved_provider, first_err)
+             fb_client, fb_model, fb_label = _try_payment_fallback(
+diff --git a/agent/gemini_cloudcode_adapter.py b/agent/gemini_cloudcode_adapter.py
+index 64c51cf9d..ea530c6f3 100644
+--- a/agent/gemini_cloudcode_adapter.py
++++ b/agent/gemini_cloudcode_adapter.py
+@@ -28,6 +28,8 @@ reverse-engineered from the opencode-gemini-auth and clawdbot implementations.
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import base64
+ import json
+ import logging
+ import time
+@@ -73,16 +75,59 @@ def _coerce_content_to_text(content: Any) -> str:
+         for p in content:
+             if isinstance(p, str):
+                 pieces.append(p)
+-            elif isinstance(p, dict):
+-                if p.get("type") == "text" and isinstance(p.get("text"), str):
+-                    pieces.append(p["text"])
+-                # Multimodal (image_url, etc.) — stub for now; log and skip
+-                elif p.get("type") in ("image_url", "input_audio"):
+-                    logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
++            elif isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
++                pieces.append(p["text"])
+         return "\n".join(pieces)
+     return str(content)
+ 
+ 
++def _extract_content_parts(content: Any) -> List[Dict[str, Any]]:
++    """Convert OpenAI text/image content parts to Gemini parts.
++
++    Vision tools pass images as data URLs in OpenAI's ``image_url`` format.
++    Code Assist accepts the same Gemini ``inlineData`` parts as the public
++    Gemini API, so keep image bytes instead of silently dropping them.
++    """
++    if not isinstance(content, list):
++        text = _coerce_content_to_text(content)
++        return [{"text": text}] if text else []
++
++    parts: List[Dict[str, Any]] = []
++    for item in content:
++        if isinstance(item, str):
++            if item:
++                parts.append({"text": item})
++            continue
++        if not isinstance(item, dict):
++            continue
++        ptype = item.get("type")
++        if ptype == "text":
++            text = item.get("text")
++            if isinstance(text, str) and text:
++                parts.append({"text": text})
++            continue
++        if ptype == "image_url":
++            image_url = item.get("image_url") or {}
++            url = image_url.get("url") if isinstance(image_url, dict) else ""
++            if not isinstance(url, str) or not url.startswith("data:"):
++                logger.debug("Dropping non-data image_url part for Code Assist")
++                continue
++            try:
++                header, encoded = url.split(",", 1)
++                mime = header.split(":", 1)[1].split(";", 1)[0]
++                raw = base64.b64decode(encoded)
++            except Exception:
++                logger.debug("Dropping invalid data image_url part for Code Assist", exc_info=True)
++                continue
++            parts.append({
++                "inlineData": {
++                    "mimeType": mime,
++                    "data": base64.b64encode(raw).decode("ascii"),
++                }
++            })
++    return parts
++
++
+ def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+     """OpenAI tool_call -> Gemini functionCall part."""
+     fn = tool_call.get("function") or {}
+@@ -155,11 +200,7 @@ def _build_gemini_contents(
+             continue
+ 
+         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
+-        parts: List[Dict[str, Any]] = []
+-
+-        text = _coerce_content_to_text(msg.get("content"))
+-        if text:
+-            parts.append({"text": text})
++        parts: List[Dict[str, Any]] = _extract_content_parts(msg.get("content"))
+ 
+         # Assistant messages can carry tool_calls
+         tool_calls = msg.get("tool_calls") or []
+@@ -577,11 +618,40 @@ class _GeminiChatCompletions:
+         return self._client._create_chat_completion(**kwargs)
+ 
+ 
++class _AsyncGeminiChatCompletions:
++    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
++        self._client = client
++
++    async def create(self, **kwargs: Any) -> Any:
++        return await self._client._create_chat_completion(**kwargs)
++
++
+ class _GeminiChatNamespace:
+     def __init__(self, client: "GeminiCloudCodeClient"):
+         self.completions = _GeminiChatCompletions(client)
+ 
+ 
++class _AsyncGeminiChatNamespace:
++    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
++        self.completions = _AsyncGeminiChatCompletions(client)
++
++
++class AsyncGeminiCloudCodeClient:
++    """Async facade over GeminiCloudCodeClient using a worker thread."""
++
++    def __init__(self, sync_client: "GeminiCloudCodeClient"):
++        self._sync_client = sync_client
++        self.api_key = sync_client.api_key
++        self.base_url = sync_client.base_url
++        self.chat = _AsyncGeminiChatNamespace(self)
++
++    async def _create_chat_completion(self, **kwargs: Any) -> Any:
++        return await asyncio.to_thread(self._sync_client._create_chat_completion, **kwargs)
++
++    async def close(self) -> None:
++        await asyncio.to_thread(self._sync_client.close)
++
++
+ class GeminiCloudCodeClient:
+     """Minimal OpenAI-SDK-compatible facade over Code Assist v1internal."""
+ 
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index 5f64636f2..f57a14f24 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -834,11 +834,13 @@ class GeminiNativeClient:
+         self.close()
+ 
+     def _headers(self) -> Dict[str, str]:
++        # Keep transport identity generic: do not brand Gemini API fallback
++        # requests as Hermes.  Callers may still pass explicit default_headers
++        # if they need provider-specific metadata.
+         headers = {
+             "Content-Type": "application/json",
+             "Accept": "application/json",
+             "x-goog-api-key": self.api_key,
+-            "User-Agent": "hermes-agent (gemini-native)",
+         }
+         headers.update(self._default_headers)
+         return headers
+diff --git a/agent/image_gen_provider.py b/agent/image_gen_provider.py
+index 47f65c1b3..c05562c7b 100644
+--- a/agent/image_gen_provider.py
++++ b/agent/image_gen_provider.py
+@@ -76,6 +76,17 @@ class ImageGenProvider(abc.ABC):
+         """
+         return True
+ 
++    @property
++    def supports_references(self) -> bool:
++        """True when :meth:`generate` accepts a ``references`` kwarg.
++
++        Providers opt in explicitly. The ``image_generate`` dispatcher uses
++        this to forward local image paths only to capable backends and to fail
++        early with ``references_unsupported`` instead of silently dropping
++        reference images.
++        """
++        return False
++
+     def list_models(self) -> List[Dict[str, Any]]:
+         """Return catalog entries for ``hermes tools`` model picker.
+ 
+@@ -140,6 +151,10 @@ class ImageGenProvider(abc.ABC):
+         or :func:`error_response`. ``kwargs`` may contain forward-compat
+         parameters future versions of the schema will expose — implementations
+         should ignore unknown keys.
++
++        Known optional kwargs:
++        - ``references``: ``list[str]`` of local image file paths, forwarded
++          only when :attr:`supports_references` is True.
+         """
+ 
+ 
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index 3f617093c..66ffee531 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
+ """
+ 
+ import logging
++import re
+ import threading
+ from typing import Callable, Optional
+ 
+@@ -24,6 +25,30 @@ _TITLE_PROMPT = (
+     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+ )
+ 
++_WORD_RE = re.compile(r"[\w\u00c0-\u024f]+(?:['’][\w\u00c0-\u024f]+)?", re.UNICODE)
++_DROP_TRAILING = {"keep", "going", "again", "please", "pls"}
++
++
++def _fallback_title_from_prompt(user_message: str) -> Optional[str]:
++    """Deterministic last-resort title when the auxiliary model returns empty content."""
++    words = _WORD_RE.findall(user_message or "")
++    cleaned = []
++    for word in words:
++        lowered = word.lower()
++        if lowered in {"hermes", "asa", "bot"}:
++            continue
++        cleaned.append(word)
++        if len(cleaned) >= 8:
++            break
++    while cleaned and cleaned[-1].lower() in _DROP_TRAILING:
++        cleaned.pop()
++    if not cleaned:
++        return None
++    title = " ".join(cleaned[:8]).strip()
++    if not title:
++        return None
++    return title[:77].rstrip() + ("..." if len(title) > 77 else "")
++
+ 
+ def generate_title(
+     user_message: str,
+@@ -53,15 +78,28 @@ def generate_title(
+     ]
+ 
+     try:
++        # Some auxiliary providers expose reasoning/thinking models behind
++        # cheap aliases. With too small a completion budget they can finish
++        # with `length` and an empty visible message, which made Discord
++        # thread auto-rename silently skip. Keep the request small, but give
++        # these models enough room to emit the actual title.
+         response = call_llm(
+             task="title_generation",
+             messages=messages,
+-            max_tokens=500,
++            max_tokens=2000,
+             temperature=0.3,
+             timeout=timeout,
+             main_runtime=main_runtime,
+         )
+-        title = (response.choices[0].message.content or "").strip()
++        choice = response.choices[0]
++        title = (choice.message.content or "").strip()
++        if not title:
++            logger.warning(
++                "Title generation returned empty content: finish_reason=%r model/task=%s",
++                getattr(choice, "finish_reason", None),
++                "title_generation",
++            )
++            title = _fallback_title_from_prompt(user_message) or ""
+         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
+         title = title.strip('"\'')
+         if title.lower().startswith("title:"):
+diff --git a/gateway/config.py b/gateway/config.py
+index ce7baffac..1abbc1d77 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -779,6 +779,15 @@ def load_gateway_config() -> GatewayConfig:
+                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
+                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
++                # Auto-rename of Hermes-owned threads after first reply.
++                # See gateway/platforms/discord_thread_rename.py for the
++                # supported delay modes and length cap.
++                if "auto_rename_threads" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_THREADS"):
++                    os.environ["DISCORD_AUTO_RENAME_THREADS"] = str(discord_cfg["auto_rename_threads"]).lower()
++                if "auto_rename_max_length" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_MAX_LENGTH"):
++                    os.environ["DISCORD_AUTO_RENAME_MAX_LENGTH"] = str(discord_cfg["auto_rename_max_length"])
++                if "auto_rename_delay" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_DELAY"):
++                    os.environ["DISCORD_AUTO_RENAME_DELAY"] = str(discord_cfg["auto_rename_delay"])
+                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
+                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+                 # ignored_channels: channels where bot never responds (even when mentioned)
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index fcd2cbc99..824e702ec 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -44,6 +44,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+ from gateway.config import Platform, PlatformConfig
+ import re
+ 
++from gateway.platforms.discord_thread_rename import (
++    load_config_from_env as _load_auto_rename_config,
++    maybe_auto_rename_thread,
++    strip_discord_mentions as _strip_discord_mentions,
++)
+ from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
+ from gateway.platforms.base import (
+     BasePlatformAdapter,
+@@ -529,6 +534,14 @@ class DiscordAdapter(BasePlatformAdapter):
+         # chunk only, default), "all" (reply-reference on every chunk).
+         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
++        # Auto-rename Hermes-owned threads with a short conversation-style
++        # title after the first assistant response.  Per-thread state lives
++        # on the adapter so we never rename twice or stomp on user-set
++        # names.  Per-thread user prompts are captured in _handle_message
++        # and consumed in send().
++        self._auto_rename_cfg = _load_auto_rename_config()
++        self._renamed_threads: set = set()
++        self._pending_user_messages: Dict[str, str] = {}
+ 
+     async def connect(self) -> bool:
+         """Connect to Discord and start receiving events."""
+@@ -1161,6 +1174,18 @@ class DiscordAdapter(BasePlatformAdapter):
+                         raise
+                 message_ids.append(str(msg.id))
+ 
++            # Hermes-owned thread? Schedule a one-shot auto-rename in the
++            # background so the user-facing reply isn't blocked on the
++            # auxiliary LLM round-trip or Discord PATCH.
++            thread_cls = getattr(discord, "Thread", None) if discord is not None else None
++            if (
++                self._auto_rename_cfg.enabled
++                and message_ids
++                and thread_cls is not None
++                and isinstance(channel, thread_cls)
++            ):
++                self._schedule_thread_auto_rename(channel, content)
++
+             return SendResult(
+                 success=True,
+                 message_id=message_ids[0] if message_ids else None,
+@@ -1171,6 +1196,45 @@ class DiscordAdapter(BasePlatformAdapter):
+             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+             return SendResult(success=False, error=str(e))
+ 
++    def _schedule_thread_auto_rename(self, thread: Any, assistant_response: str) -> None:
++        """Fire-and-forget: rename ``thread`` based on the captured user prompt.
++
++        Pops the pending user message so a second send into the same
++        thread doesn't re-trigger a rename mid-conversation; the
++        ``_renamed_threads`` set is the persistent guard.
++        """
++        thread_id = str(getattr(thread, "id", "") or "")
++        if not thread_id:
++            return
++        if thread_id in self._renamed_threads:
++            return
++        if thread_id not in self._threads:
++            return
++        user_message = self._pending_user_messages.pop(thread_id, None)
++        if not user_message:
++            return
++
++        cfg = self._auto_rename_cfg
++        renamed_threads = self._renamed_threads
++
++        async def _runner():
++            await maybe_auto_rename_thread(
++                thread,
++                user_message,
++                assistant_response,
++                cfg,
++                is_renamed=lambda: thread_id in renamed_threads,
++                on_renamed=lambda _title: renamed_threads.add(thread_id),
++            )
++
++        try:
++            asyncio.create_task(_runner())
++        except RuntimeError:
++            # No running loop (rare: send() called outside the bot loop —
++            # e.g. in unit tests).  Silently skip — auto-rename is
++            # non-essential.
++            logger.debug("[%s] No event loop available to auto-rename %s", self.name, thread_id)
++
+     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+         """Create a thread post in a forum channel with the message as starter content.
+ 
+@@ -2961,11 +3025,9 @@ class DiscordAdapter(BasePlatformAdapter):
+         # syntax (users / roles / channels) so thread titles don't end up
+         # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
+         # meaningful to humans glancing at the thread list (#6336).
+-        content = (message.content or "").strip()
+-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
+-        content = re.sub(r"<@[!&]?\d+>", "", content)
+-        content = re.sub(r"<#\d+>", "", content)
+-        content = re.sub(r"\s+", " ", content).strip()
++        # Shared with discord_thread_rename so the auto-rename hook
++        # compares apples-to-apples when checking the seeded name.
++        content = _strip_discord_mentions(message.content or "")
+         thread_name = content[:80] if content else "Hermes"
+         if len(content) > 80:
+             thread_name = thread_name[:77] + "..."
+@@ -3475,6 +3537,27 @@ class DiscordAdapter(BasePlatformAdapter):
+         # so forum descriptions (e.g. project instructions) appear in the session context.
+         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
+ 
++        # Capture the user prompt so the auto-rename hook in send() can
++        # generate a title from the same exchange.  Only stash for threads
++        # that Hermes owns (auto-created or already-participated) so we
++        # don't accidentally rename arbitrary threads someone happened to
++        # @mention us in.
++        #
++        # Apply the same <@id>/<@!id>/<@&id>/<#id> stripping that
++        # _auto_create_thread uses to seed the thread name; otherwise
++        # looks_like_raw_prompt() would diverge for prompts that contain
++        # role/channel/user mentions and we'd skip the rename.
++        if (
++            self._auto_rename_cfg.enabled
++            and is_thread
++            and thread_id
++            and thread_id in self._threads
++            and thread_id not in self._renamed_threads
++        ):
++            captured_prompt = _strip_discord_mentions(normalized_content)
++            if captured_prompt:
++                self._pending_user_messages[thread_id] = captured_prompt
++
+         # Build source
+         guild = getattr(message, "guild", None)
+         source = self.build_source(
+diff --git a/plugins/image_gen/openai-codex/__init__.py b/plugins/image_gen/openai-codex/__init__.py
+index ab524dbdd..2ee56ebe7 100644
+--- a/plugins/image_gen/openai-codex/__init__.py
++++ b/plugins/image_gen/openai-codex/__init__.py
+@@ -15,12 +15,20 @@ Selection precedence for the tier (first hit wins):
+ 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+ 
+ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
++
++Also supports multi-reference input (up to 16 local image paths) via the
++Codex Responses ``input_image`` message content. Callers pass
++``references=[path1, path2, ...]`` and the backend uses them for composition,
++style transfer, and image-to-image edits.
+ """
+ 
+ from __future__ import annotations
+ 
++import base64
+ import logging
+-from typing import Any, Dict, List, Optional, Tuple
++import mimetypes
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+ from agent.image_gen_provider import (
+     DEFAULT_ASPECT_RATIO,
+@@ -62,6 +70,7 @@ _MODELS: Dict[str, Dict[str, Any]] = {
+ }
+ 
+ DEFAULT_MODEL = "gpt-image-2-medium"
++MAX_REFERENCES = 16
+ 
+ _SIZES = {
+     "landscape": "1536x1024",
+@@ -161,7 +170,55 @@ def _build_codex_client():
+         return None
+ 
+ 
+-def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> Optional[str]:
++def _load_reference_images(paths: Sequence[Any]) -> Tuple[List[Tuple[str, str]], Optional[str]]:
++    """Load local reference images into ``(mime, base64)`` pairs."""
++    loaded: List[Tuple[str, str]] = []
++    for raw in paths:
++        if len(loaded) >= MAX_REFERENCES:
++            break
++        if not isinstance(raw, (str, Path)):
++            return loaded, f"reference path must be a string, got {type(raw).__name__}"
++        path = Path(str(raw)).expanduser()
++        if not path.is_file():
++            return loaded, f"reference not found: {path}"
++        mime, _ = mimetypes.guess_type(path.name)
++        if not mime or not mime.startswith("image/"):
++            mime = "image/png"
++        try:
++            encoded = base64.b64encode(path.read_bytes()).decode()
++        except OSError as exc:
++            return loaded, f"could not read reference {path}: {exc}"
++        loaded.append((mime, encoded))
++    return loaded, None
++
++
++def _build_user_content(prompt: str, references: Sequence[Tuple[str, str]]) -> List[Dict[str, Any]]:
++    """Build Responses API user content with optional ``input_image`` items."""
++    if references:
++        labelled = prompt + "\n\n" + "\n".join(
++            f"Reference image {i + 1} is provided below."
++            for i in range(len(references))
++        )
++    else:
++        labelled = prompt
++
++    content: List[Dict[str, Any]] = [{"type": "input_text", "text": labelled}]
++    for mime, b64 in references:
++        content.append({
++            "type": "input_image",
++            "image_url": f"data:{mime};base64,{b64}",
++        })
++    return content
++
++
++def _collect_image_b64(
++    client: Any,
++    *,
++    prompt: str,
++    size: str,
++    quality: str,
++    references: Sequence[Tuple[str, str]] = (),
++) -> Optional[str]:
+     """Stream a Codex Responses image_generation call and return the b64 image."""
+     image_b64: Optional[str] = None
+ 
+@@ -172,7 +229,7 @@ def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) ->
+         input=[{
+             "type": "message",
+             "role": "user",
+-            "content": [{"type": "input_text", "text": prompt}],
++            "content": _build_user_content(prompt, references),
+         }],
+         tools=[{
+             "type": "image_generation",
+@@ -230,6 +287,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+     def display_name(self) -> str:
+         return "OpenAI (Codex auth)"
+ 
++    @property
++    def supports_references(self) -> bool:
++        return True
++
+     def is_available(self) -> bool:
+         if not _read_codex_access_token():
+             return False
+@@ -307,6 +368,27 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+         tier_id, meta = _resolve_model()
+         size = _SIZES.get(aspect, _SIZES["square"])
+ 
++        raw_refs = kwargs.get("references") or []
++        if not isinstance(raw_refs, (list, tuple)):
++            return error_response(
++                error=f"references must be a list of image paths, got {type(raw_refs).__name__}",
++                error_type="invalid_argument",
++                provider="openai-codex",
++                model=tier_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++        references, ref_error = _load_reference_images(raw_refs)
++        if ref_error is not None:
++            return error_response(
++                error=ref_error,
++                error_type="invalid_reference",
++                provider="openai-codex",
++                model=tier_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
+         client = _build_codex_client()
+         if client is None:
+             return error_response(
+@@ -324,6 +406,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+                 prompt=prompt,
+                 size=size,
+                 quality=meta["quality"],
++                references=references,
+             )
+         except Exception as exc:
+             logger.debug("Codex image generation failed", exc_info=True)
+@@ -364,7 +447,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+             prompt=prompt,
+             aspect_ratio=aspect,
+             provider="openai-codex",
+-            extra={"size": size, "quality": meta["quality"]},
++            extra={"size": size, "quality": meta["quality"], "references": len(references)},
+         )
+ 
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 26933994d..091596ca4 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -8996,6 +8996,7 @@ class AIAgent:
+             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
+             focus_topic,
+         )
++        self._touch_activity("compressing context")
+ 
+         # Notify external memory provider before compression discards context
+         if self._memory_manager:
+diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.js
+index d1aeb7372..a65b6c3f0 100644
+--- a/scripts/whatsapp-bridge/bridge.js
++++ b/scripts/whatsapp-bridge/bridge.js
+@@ -43,6 +43,7 @@ const WHATSAPP_DEBUG =
+ 
+ const PORT = parseInt(getArg('port', '3000'), 10);
+ const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
++const QR_FILE = getArg('qr-file', process.env.WHATSAPP_QR_FILE || path.join(SESSION_DIR, '..', 'current-qr.txt'));
+ const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
+ const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
+ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+@@ -147,6 +148,7 @@ async function startSocket() {
+     const { connection, lastDisconnect, qr } = update;
+ 
+     if (qr) {
++      try { writeFileSync(QR_FILE, qr, 'utf8'); } catch {}
+       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
+       qrcode.generate(qr, { small: true });
+       console.log('\nWaiting for scan...\n');
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 32290b061..0231cfafc 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -4,6 +4,7 @@ import json
+ import logging
+ import os
+ from pathlib import Path
++from types import SimpleNamespace
+ from unittest.mock import patch, MagicMock, AsyncMock
+ 
+ import pytest
+@@ -22,6 +23,8 @@ from agent.auxiliary_client import (
+     _normalize_aux_provider,
+     _try_payment_fallback,
+     _resolve_auto,
++    _get_task_fallback_specs,
++    _is_capacity_or_rate_error,
+ )
+ 
+ 
+@@ -32,6 +35,7 @@ def _clean_env(monkeypatch):
+         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
+         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
+         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
++        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_BASE_URL",
+     ):
+         monkeypatch.delenv(key, raising=False)
+ 
+@@ -885,6 +889,85 @@ class TestCallLlmPaymentFallback:
+                     messages=[{"role": "user", "content": "hello"}],
+                 )
+ 
++class TestAuxiliaryConfiguredFallbacks:
++    """Configured auxiliary.<task>.fallbacks are used for retryable errors."""
++
++    def test_get_task_fallback_specs_normalizes_strings_and_dicts(self, monkeypatch):
++        monkeypatch.setattr(
++            "agent.auxiliary_client._get_auxiliary_task_config",
++            lambda task: {
++                "fallbacks": [
++                    "gemini",
++                    {"provider": "anthropic", "model": "claude-opus-4-7"},
++                    {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
++                    "",
++                    {},
++                ],
++            },
++        )
++
++        assert _get_task_fallback_specs("vision") == [
++            {"provider": "gemini"},
++            {"provider": "anthropic", "model": "claude-opus-4-7"},
++            {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
++        ]
++
++    @pytest.mark.parametrize("message,status", [
++        ("capacity exhausted", None),
++        ("quota exceeded", None),
++        ("rate limit", 500),
++        ("Too Many Requests", 429),
++    ])
++    def test_capacity_or_rate_errors_are_retryable(self, message, status):
++        err = Exception(message)
++        if status is not None:
++            err.status_code = status
++        assert _is_capacity_or_rate_error(err) is True
++
++    def test_explicit_vision_provider_uses_configured_fallback_on_429(self, monkeypatch):
++        primary_client = MagicMock()
++        rate_err = Exception("capacity exhausted")
++        rate_err.status_code = 429
++        primary_client.chat.completions.create.side_effect = rate_err
++
++        fallback_client = MagicMock()
++        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
++        fallback_client.chat.completions.create.return_value = response
++
++        def fake_resolve_vision_provider_client(provider=None, model=None, **kwargs):
++            if provider == "google-gemini-cli":
++                return "google-gemini-cli", primary_client, "gemini-3-flash-preview"
++            if provider == "gemini":
++                return "gemini", fallback_client, "gemini-3-flash-preview"
++            return provider, None, None
++
++        monkeypatch.setattr(
++            "agent.auxiliary_client._resolve_task_provider_model",
++            lambda *args, **kwargs: (
++                "google-gemini-cli", "gemini-3-flash-preview", None, None, None
++            ),
++        )
++        monkeypatch.setattr(
++            "agent.auxiliary_client._get_auxiliary_task_config",
++            lambda task: {"fallbacks": [{"provider": "gemini", "model": "gemini-3-flash-preview"}]},
++        )
++        monkeypatch.setattr(
++            "agent.auxiliary_client.resolve_vision_provider_client",
++            fake_resolve_vision_provider_client,
++        )
++
++        result = call_llm(
++            task="vision",
++            messages=[{"role": "user", "content": "describe image"}],
++            max_tokens=32,
++        )
++
++        assert result is response
++        assert primary_client.chat.completions.create.call_count == 1
++        assert fallback_client.chat.completions.create.call_count == 1
++        assert fallback_client.chat.completions.create.call_args.kwargs["model"] == "gemini-3-flash-preview"
++
++
+ # ---------------------------------------------------------------------------
+ # Gate: _resolve_api_key_provider must skip anthropic when not configured
+ # ---------------------------------------------------------------------------
+@@ -1077,7 +1160,6 @@ class TestKimiTemperatureOmitted:
+         "model",
+         [
+             "anthropic/claude-sonnet-4-6",
+-            "gpt-5.4",
+             "deepseek-chat",
+         ],
+     )
+@@ -1093,6 +1175,20 @@ class TestKimiTemperatureOmitted:
+ 
+         assert kwargs["temperature"] == 0.3
+ 
++
++    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5", "o3-mini", "o4-mini"])
++    def test_openai_reasoning_models_omit_temperature(self, model):
++        from agent.auxiliary_client import _build_call_kwargs
++
++        kwargs = _build_call_kwargs(
++            provider="openrouter",
++            model=model,
++            messages=[{"role": "user", "content": "hello"}],
++            temperature=0.3,
++        )
++
++        assert "temperature" not in kwargs
++
+     @pytest.mark.parametrize(
+         "base_url",
+         [
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index e10cba76a..264a00347 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -52,13 +52,14 @@ class TestGenerateTitle:
+             assert len(title) == 80
+             assert title.endswith("...")
+ 
+-    def test_returns_none_on_empty_response(self):
++    def test_falls_back_to_prompt_on_empty_response(self):
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = ""
++        mock_response.choices[0].finish_reason = "length"
+ 
+         with patch("agent.title_generator.call_llm", return_value=mock_response):
+-            assert generate_title("question", "answer") is None
++            assert generate_title("gateway shut down again, keep going", "answer") == "gateway shut down"
+ 
+     def test_returns_none_on_exception(self):
+         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
+diff --git a/tests/plugins/image_gen/test_openai_codex_provider.py b/tests/plugins/image_gen/test_openai_codex_provider.py
+index 3c8cf86c0..cd4d22e78 100644
+--- a/tests/plugins/image_gen/test_openai_codex_provider.py
++++ b/tests/plugins/image_gen/test_openai_codex_provider.py
+@@ -199,6 +199,43 @@ class TestGenerate:
+         assert tool["background"] == "opaque"
+         assert tool["partial_images"] == 1
+ 
++    def test_reference_images_are_sent_as_input_images(self, provider, monkeypatch, tmp_path):
++        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
++        ref = tmp_path / "ref.png"
++        ref.write_bytes(bytes.fromhex(_PNG_HEX))
++        captured = {}
++
++        def _stream(**kwargs):
++            captured.update(kwargs)
++            output_item = SimpleNamespace(
++                type="image_generation_call",
++                status="generating",
++                id="ig_test",
++                result=_b64_png(),
++            )
++            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
++            final_response = SimpleNamespace(output=[], status="completed", output_text="")
++            return _FakeStream([done_event], final_response)
++
++        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
++        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
++
++        result = provider.generate("restyle this", references=[str(ref)])
++
++        assert result["success"] is True
++        assert result["references"] == 1
++        content = captured["input"][0]["content"]
++        assert content[0]["type"] == "input_text"
++        assert content[1]["type"] == "input_image"
++        assert content[1]["image_url"].startswith("data:image/png;base64,")
++
++    def test_invalid_reference_path_returns_error(self, provider, monkeypatch, tmp_path):
++        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
++        result = provider.generate("restyle this", references=[str(tmp_path / "missing.png")])
++
++        assert result["success"] is False
++        assert result["error_type"] == "invalid_reference"
++
+     def test_partial_image_event_used_when_done_missing(self, provider, monkeypatch):
+         """If the stream never emits output_item.done, fall back to the
+         partial_image event so users at least get the latest preview frame."""
+diff --git a/tests/tools/test_image_generation_plugin_dispatch.py b/tests/tools/test_image_generation_plugin_dispatch.py
+index fa8ca9d95..15794c280 100644
+--- a/tests/tools/test_image_generation_plugin_dispatch.py
++++ b/tests/tools/test_image_generation_plugin_dispatch.py
+@@ -97,3 +97,88 @@ class TestPluginDispatch:
+         assert payload["success"] is True
+         assert payload["provider"] == "codex"
+         assert payload["aspect_ratio"] == "portrait"
++
++    def test_dispatch_rejects_references_for_unsupported_provider(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++        from hermes_cli import plugins as plugins_module
++        from agent import image_gen_registry as registry_module
++
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
++        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
++        monkeypatch.setattr(registry_module, "get_provider", lambda name: _FakeCodexProvider())
++
++        dispatched = image_generation_tool._dispatch_to_plugin_provider(
++            "draw cat",
++            "square",
++            references=["/tmp/ref.png"],
++        )
++        payload = json.loads(dispatched)
++
++        assert payload["success"] is False
++        assert payload["error_type"] == "references_unsupported"
++
++    def test_dispatch_forwards_references_to_supported_provider(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++        from hermes_cli import plugins as plugins_module
++        from agent import image_gen_registry as registry_module
++
++        class _ReferenceProvider(_FakeCodexProvider):
++            seen = None
++
++            @property
++            def supports_references(self) -> bool:
++                return True
++
++            def generate(self, prompt, aspect_ratio="landscape", **kwargs):
++                self.seen = kwargs.get("references")
++                result = super().generate(prompt, aspect_ratio, **kwargs)
++                result["references"] = self.seen
++                return result
++
++        provider = _ReferenceProvider()
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
++        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
++        monkeypatch.setattr(registry_module, "get_provider", lambda name: provider)
++
++        dispatched = image_generation_tool._dispatch_to_plugin_provider(
++            "draw cat",
++            "square",
++            references=["/tmp/ref.png"],
++        )
++        payload = json.loads(dispatched)
++
++        assert payload["success"] is True
++        assert payload["references"] == ["/tmp/ref.png"]
++
++    def test_materialize_downloads_reference_url_to_cache_without_preserving_query(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++
++        class _Headers(dict):
++            def get(self, key, default=None):
++                return super().get(key, default)
++
++        class _Response:
++            headers = _Headers({"Content-Type": "image/png"})
++
++            def __enter__(self):
++                return self
++
++            def __exit__(self, *args):
++                return False
++
++            def read(self, limit):
++                return b"\x89PNG\r\n\x1a\n"
++
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "urlopen", lambda req, timeout=20: _Response())
++
++        refs, error = image_generation_tool._materialize_reference_inputs({
++            "reference_image_url": "https://cdn.discordapp.com/attachments/a/b/ref.png?ex=secret&hm=secret",
++        })
++
++        assert error is None
++        assert len(refs) == 1
++        assert refs[0].startswith(str(tmp_path / "cache" / "image_references"))
++        assert "?" not in refs[0]
+diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
+index ac3744978..54c03f0f2 100644
+--- a/tools/image_generation_tool.py
++++ b/tools/image_generation_tool.py
+@@ -26,8 +26,10 @@ import os
+ import datetime
+ import threading
+ import uuid
+-from typing import Any, Dict, Optional, Union
+-from urllib.parse import urlencode
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Union
++from urllib.parse import urlencode, urlsplit
++from urllib.request import Request, urlopen
+ 
+ import fal_client
+ 
+@@ -851,10 +853,97 @@ if __name__ == "__main__":
+ # ---------------------------------------------------------------------------
+ from tools.registry import registry, tool_error
+ 
++_REFERENCE_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
++
++
++def _redact_url_for_error(url: str) -> str:
++    """Return a URL safe for logs/errors by stripping signed query params."""
++    try:
++        parts = urlsplit(url)
++        safe_path = parts.path
++        if len(safe_path) > 80:
++            safe_path = "..." + safe_path[-77:]
++        return f"{parts.scheme}://{parts.netloc}{safe_path}"
++    except Exception:
++        return "[invalid-url]"
++
++
++def _reference_cache_dir() -> Path:
++    from hermes_constants import get_hermes_home
++
++    path = get_hermes_home() / "cache" / "image_references"
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def _download_reference_url(url: str) -> str:
++    """Download a remote image reference into Hermes cache and return its path."""
++    parts = urlsplit(url)
++    if parts.scheme not in {"http", "https"} or not parts.netloc:
++        raise ValueError("reference_image_url must be an http(s) URL")
++
++    safe_url = _redact_url_for_error(url)
++    req = Request(url, headers={"User-Agent": "HermesAgent/1.0 image-reference-fetch"})
++    try:
++        with urlopen(req, timeout=20) as resp:
++            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
++            if content_type and not content_type.startswith("image/"):
++                raise ValueError(f"reference URL did not return an image: {content_type}")
++            content_length = resp.headers.get("Content-Length")
++            if content_length and int(content_length) > _REFERENCE_DOWNLOAD_MAX_BYTES:
++                raise ValueError("reference image is too large (>25MB)")
++            data = resp.read(_REFERENCE_DOWNLOAD_MAX_BYTES + 1)
++    except Exception as exc:
++        raise ValueError(f"could not download reference image {safe_url}: {exc}") from exc
++
++    if len(data) > _REFERENCE_DOWNLOAD_MAX_BYTES:
++        raise ValueError("reference image is too large (>25MB)")
++    if not data:
++        raise ValueError(f"reference URL returned no data: {safe_url}")
++
++    ext = "png"
++    if content_type == "image/jpeg":
++        ext = "jpg"
++    elif content_type == "image/webp":
++        ext = "webp"
++    elif content_type == "image/gif":
++        ext = "gif"
++    elif content_type == "image/png":
++        ext = "png"
++
++    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++    path = _reference_cache_dir() / f"reference_{ts}_{uuid.uuid4().hex[:8]}.{ext}"
++    path.write_bytes(data)
++    return str(path)
++
++
++def _materialize_reference_inputs(args: Dict[str, Any]) -> tuple[List[str], Optional[str]]:
++    """Normalize local/remote reference args into local image file paths."""
++    references: List[str] = []
++    raw_references = args.get("references") or []
++    if not isinstance(raw_references, list):
++        return [], "references must be a list of image file paths"
++    references.extend(r.strip() for r in raw_references if isinstance(r, str) and r.strip())
++
++    reference_image_path = args.get("reference_image_path")
++    if isinstance(reference_image_path, str) and reference_image_path.strip():
++        references.append(reference_image_path.strip())
++
++    reference_image_url = args.get("reference_image_url")
++    if isinstance(reference_image_url, str) and reference_image_url.strip():
++        try:
++            references.append(_download_reference_url(reference_image_url.strip()))
++        except ValueError as exc:
++            return [], str(exc)
++
++    return references, None
++
++
+ IMAGE_GENERATE_SCHEMA = {
+     "name": "image_generate",
+     "description": (
+-        "Generate high-quality images from text prompts. The underlying "
++        "Generate high-quality images from text prompts, optionally conditioned "
++        "on reference images when the active provider supports them. The underlying "
+         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
+         "selectable by the agent. Returns either a URL or an absolute file "
+         "path in the `image` field; display it with markdown "
+@@ -873,6 +962,19 @@ IMAGE_GENERATE_SCHEMA = {
+                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
+                 "default": DEFAULT_ASPECT_RATIO,
+             },
++            "references": {
++                "type": "array",
++                "items": {"type": "string"},
++                "description": "Optional local image file paths to use as visual references. Only supported by reference-capable providers such as openai-codex.",
++            },
++            "reference_image_path": {
++                "type": "string",
++                "description": "Optional single local image file path to use as a visual reference.",
++            },
++            "reference_image_url": {
++                "type": "string",
++                "description": "Optional HTTP(S) image URL to download immediately into Hermes cache and use as a visual reference. Signed URLs are not persisted in logs or errors.",
++            },
+         },
+         "required": ["prompt"],
+     },
+@@ -900,7 +1002,7 @@ def _read_configured_image_provider():
+     return None
+ 
+ 
+-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
++def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, references: Optional[List[str]] = None):
+     """Route the call to a plugin-registered provider when one is selected.
+ 
+     Returns a JSON string on dispatch, or ``None`` to fall through to the
+@@ -949,8 +1051,20 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+             "error_type": "provider_not_registered",
+         })
+ 
++    if references and not getattr(provider, "supports_references", False):
++        return json.dumps({
++            "success": False,
++            "image": None,
++            "error": f"Provider '{getattr(provider, 'name', '?')}' does not support reference images",
++            "error_type": "references_unsupported",
++        })
++
+     try:
+-        result = provider.generate(prompt=prompt, aspect_ratio=aspect_ratio)
++        result = provider.generate(
++            prompt=prompt,
++            aspect_ratio=aspect_ratio,
++            **({"references": references} if references else {}),
++        )
+     except Exception as exc:
+         logger.warning(
+             "Image gen provider '%s' raised: %s",
+@@ -980,10 +1094,16 @@ def _handle_image_generate(args, **kw):
+ 
+     # Route to a plugin-registered provider if one is active (and it's
+     # not the in-tree FAL path).
+-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
++    references, ref_error = _materialize_reference_inputs(args)
++    if ref_error:
++        return tool_error(ref_error)
++    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, references)
+     if dispatched is not None:
+         return dispatched
+ 
++    if references:
++        return tool_error("Reference images are only supported by plugin image providers such as openai-codex")
++
+     return image_generate_tool(
+         prompt=prompt,
+         aspect_ratio=aspect_ratio,
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index b03beef8e..217a84f46 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -570,10 +570,12 @@ export default function App() {
+                   {routes.map(({ key, path, element }) => (
+                     <Route key={key} path={path} element={element} />
+                   ))}
+-                  <Route
+-                    path="*"
+-                    element={<Navigate to="/sessions" replace />}
+-                  />
++                  {!pluginsLoading && (
++                    <Route
++                      path="*"
++                      element={<Navigate to="/sessions" replace />}
++                    />
++                  )}
+                 </Routes>
+ 
+                 {embeddedChat &&

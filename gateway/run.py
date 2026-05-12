@@ -9906,11 +9906,45 @@ class GatewayRunner:
 
         return True
 
+    @staticmethod
+    def _split_voice_reply_text(text: str, max_chars: int = 850) -> List[str]:
+        """Split TTS text into short chunks suitable for mobile voice notes."""
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        chunks: List[str] = []
+        current = ""
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if len(part) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                for start in range(0, len(part), max_chars):
+                    chunks.append(part[start:start + max_chars].strip())
+                continue
+            candidate = f"{current} {part}".strip()
+            if current and len(candidate) > max_chars:
+                chunks.append(current)
+                current = part
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+        return chunks
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply."""
+        """Generate TTS audio and send as voice messages before the text reply."""
         import uuid as _uuid
-        audio_path = None
-        actual_path = None
+        paths_to_cleanup = set()
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -9918,49 +9952,59 @@ class GatewayRunner:
             if not tts_text:
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
-            )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
-            )
-            result = json.loads(result_json)
-
-            # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual_path):
-                logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
-
             adapter = self.adapters.get(event.source.platform)
+            if adapter and hasattr(adapter, "send_recording_indicator"):
+                import inspect as _inspect
+                metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                recording_result = adapter.send_recording_indicator(
+                    event.source.chat_id,
+                    metadata=metadata,
+                )
+                if _inspect.isawaitable(recording_result):
+                    await recording_result
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
-            if (guild_id
-                    and hasattr(adapter, "play_in_voice_channel")
-                    and hasattr(adapter, "is_in_voice_channel")
-                    and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
-            elif adapter and hasattr(adapter, "send_voice"):
-                reply_anchor = self._reply_anchor_for_event(event)
-                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-                send_kwargs: Dict[str, Any] = {
-                    "chat_id": event.source.chat_id,
-                    "audio_path": actual_path,
-                    "reply_to": reply_anchor,
-                }
-                if thread_meta:
-                    send_kwargs["metadata"] = thread_meta
-                await adapter.send_voice(**send_kwargs)
+            chunks = self._split_voice_reply_text(tts_text)
+            for index, chunk in enumerate(chunks):
+                # Use .mp3 extension so edge-tts conversion to opus works correctly.
+                # The TTS tool may convert to .ogg, so use file_path from result.
+                audio_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_voice",
+                    f"tts_reply_{_uuid.uuid4().hex[:12]}_{index + 1}.mp3",
+                )
+                paths_to_cleanup.add(audio_path)
+                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+                result_json = await asyncio.to_thread(
+                    text_to_speech_tool, text=chunk, output_path=audio_path
+                )
+                result = json.loads(result_json)
+
+                actual_path = result.get("file_path", audio_path)
+                paths_to_cleanup.add(actual_path)
+                if not result.get("success") or not os.path.isfile(actual_path):
+                    logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+                    continue
+
+                if (guild_id
+                        and hasattr(adapter, "play_in_voice_channel")
+                        and hasattr(adapter, "is_in_voice_channel")
+                        and adapter.is_in_voice_channel(guild_id)):
+                    await adapter.play_in_voice_channel(guild_id, actual_path)
+                elif adapter and hasattr(adapter, "send_voice"):
+                    send_kwargs: Dict[str, Any] = {
+                        "chat_id": event.source.chat_id,
+                        "audio_path": actual_path,
+                        "reply_to": event.message_id if index == 0 else None,
+                    }
+                    if event.source.thread_id:
+                        send_kwargs["metadata"] = {"thread_id": event.source.thread_id}
+                    await adapter.send_voice(**send_kwargs)
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
+            for p in paths_to_cleanup - {None}:
                 try:
                     os.unlink(p)
                 except OSError:

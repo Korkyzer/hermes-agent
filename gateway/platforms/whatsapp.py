@@ -1029,6 +1029,24 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 pass
         except Exception:
             pass  # Ignore typing indicator failures
+
+    async def send_recording_indicator(self, chat_id: str, metadata=None) -> None:
+        """Send WhatsApp recording presence before a voice reply."""
+        if not self._running or not self._http_session:
+            return
+        if await self._check_managed_bridge_exit():
+            return
+
+        try:
+            import aiohttp
+
+            await self._http_session.post(
+                f"http://127.0.0.1:{self._bridge_port}/typing",
+                json={"chatId": chat_id, "presence": "recording"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+        except Exception:
+            pass
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""
@@ -1125,53 +1143,55 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Download media URLs to the local cache so agent tools
             # can access them reliably regardless of URL expiration.
             raw_urls = data.get("mediaUrls", [])
+            raw_media_types = data.get("mediaTypes") or []
             cached_urls = []
             media_types = []
-            for url in raw_urls:
+            for idx, url in enumerate(raw_urls):
+                raw_mime = str(raw_media_types[idx] if idx < len(raw_media_types) else "").strip()
                 if msg_type == MessageType.PHOTO and url.startswith(("http://", "https://")):
                     try:
                         cached_path = await cache_image_from_url(url, ext=".jpg")
                         cached_urls.append(cached_path)
-                        media_types.append("image/jpeg")
+                        media_types.append(raw_mime or "image/jpeg")
                         print(f"[{self.name}] Cached user image: {cached_path}", flush=True)
                     except Exception as e:
                         print(f"[{self.name}] Failed to cache image: {e}", flush=True)
                         cached_urls.append(url)
-                        media_types.append("image/jpeg")
+                        media_types.append(raw_mime or "image/jpeg")
                 elif msg_type == MessageType.PHOTO and os.path.isabs(url):
                     # Local file path — bridge already downloaded the image
                     cached_urls.append(url)
-                    media_types.append("image/jpeg")
+                    media_types.append(raw_mime or "image/jpeg")
                     print(f"[{self.name}] Using bridge-cached image: {url}", flush=True)
                 elif msg_type == MessageType.VOICE and url.startswith(("http://", "https://")):
                     try:
                         cached_path = await cache_audio_from_url(url, ext=".ogg")
                         cached_urls.append(cached_path)
-                        media_types.append("audio/ogg")
+                        media_types.append(raw_mime or "audio/ogg")
                         print(f"[{self.name}] Cached user voice: {cached_path}", flush=True)
                     except Exception as e:
                         print(f"[{self.name}] Failed to cache voice: {e}", flush=True)
                         cached_urls.append(url)
-                        media_types.append("audio/ogg")
+                        media_types.append(raw_mime or "audio/ogg")
                 elif msg_type == MessageType.VOICE and os.path.isabs(url):
                     # Local file path — bridge already downloaded the audio
                     cached_urls.append(url)
-                    media_types.append("audio/ogg")
+                    media_types.append(raw_mime or "audio/ogg")
                     print(f"[{self.name}] Using bridge-cached audio: {url}", flush=True)
                 elif msg_type == MessageType.DOCUMENT and os.path.isabs(url):
                     # Local file path — bridge already downloaded the document
                     cached_urls.append(url)
                     ext = Path(url).suffix.lower()
-                    mime = SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
+                    mime = raw_mime or SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
                     media_types.append(mime)
                     print(f"[{self.name}] Using bridge-cached document: {url}", flush=True)
                 elif msg_type == MessageType.VIDEO and os.path.isabs(url):
                     cached_urls.append(url)
-                    media_types.append("video/mp4")
+                    media_types.append(raw_mime or "video/mp4")
                     print(f"[{self.name}] Using bridge-cached video: {url}", flush=True)
                 else:
                     cached_urls.append(url)
-                    media_types.append("unknown")
+                    media_types.append(raw_mime or "unknown")
 
             # For text-readable documents, inject file content directly into
             # the message text so the agent can read it inline.

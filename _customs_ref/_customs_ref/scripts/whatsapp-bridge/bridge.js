@@ -252,7 +252,6 @@ async function startSocket() {
       let hasMedia = false;
       let mediaType = '';
       const mediaUrls = [];
-      const mediaTypes = [];
 
       if (messageContent.conversation) {
         body = messageContent.conversation;
@@ -271,7 +270,6 @@ async function startSocket() {
           const filePath = path.join(IMAGE_CACHE_DIR, `img_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
-          mediaTypes.push(mime);
         } catch (err) {
           console.error('[bridge] Failed to download image:', err.message);
         }
@@ -287,7 +285,6 @@ async function startSocket() {
           const filePath = path.join(DOCUMENT_CACHE_DIR, `vid_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
-          mediaTypes.push(mime);
         } catch (err) {
           console.error('[bridge] Failed to download video:', err.message);
         }
@@ -303,7 +300,6 @@ async function startSocket() {
           const filePath = path.join(AUDIO_CACHE_DIR, `aud_${randomBytes(6).toString('hex')}${ext}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
-          mediaTypes.push(mime);
         } catch (err) {
           console.error('[bridge] Failed to download audio:', err.message);
         }
@@ -319,7 +315,6 @@ async function startSocket() {
           const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
-          mediaTypes.push(messageContent.documentMessage.mimetype || 'application/octet-stream');
         } catch (err) {
           console.error('[bridge] Failed to download document:', err.message);
         }
@@ -361,7 +356,6 @@ async function startSocket() {
         hasMedia,
         mediaType,
         mediaUrls,
-        mediaTypes,
         mentionedIds,
         quotedParticipant,
         botIds,
@@ -550,12 +544,11 @@ app.post('/typing', async (req, res) => {
     return res.status(503).json({ error: 'Not connected' });
   }
 
-  const { chatId, presence } = req.body;
+  const { chatId } = req.body;
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
 
   try {
-    const state = ['composing', 'recording', 'paused'].includes(presence) ? presence : 'composing';
-    await sock.sendPresenceUpdate(state, chatId);
+    await sock.sendPresenceUpdate('composing', chatId);
     res.json({ success: true });
   } catch (err) {
     res.json({ success: false });

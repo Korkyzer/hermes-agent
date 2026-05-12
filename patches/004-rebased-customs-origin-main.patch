@@ -1,0 +1,3774 @@
+From bf62049483c7188d39e64c03eabf2e0251292df7 Mon Sep 17 00:00:00 2001
+From: codex-high <codex-high@multica.local>
+Date: Tue, 12 May 2026 11:14:51 +0000
+Subject: [PATCH] Rebase Koruki Hermes customizations
+
+---
+ agent/auxiliary_client.py                     |  139 ++-
+ agent/gemini_cloudcode_adapter.py             |   92 +-
+ agent/gemini_native_adapter.py                |   26 +-
+ agent/image_gen_provider.py                   |   15 +
+ agent/title_generator.py                      |   56 +-
+ gateway/config.py                             |    9 +
+ gateway/platforms/discord.py                  |   87 +-
+ gateway/platforms/discord_thread_rename.py    |  265 +++++
+ plugins/image_gen/openai-codex/__init__.py    |   91 +-
+ run_agent.py                                  |    1 +
+ scripts/whatsapp-bridge/bridge.js             |  163 +--
+ tests/agent/test_auxiliary_client.py          | 1026 ++---------------
+ tests/agent/test_title_generator.py           |   36 +-
+ tests/gateway/test_discord_thread_rename.py   |  373 ++++++
+ .../image_gen/test_openai_codex_provider.py   |   37 +
+ .../test_image_generation_plugin_dispatch.py  |   85 ++
+ tools/image_generation_tool.py                |  201 ++--
+ web/src/App.tsx                               |  189 +--
+ 18 files changed, 1506 insertions(+), 1385 deletions(-)
+ create mode 100755 gateway/platforms/discord_thread_rename.py
+ create mode 100755 tests/gateway/test_discord_thread_rename.py
+
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index da69f040..f23d3234 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -132,6 +132,9 @@ _PROVIDER_ALIASES = {
+     "google": "gemini",
+     "google-gemini": "gemini",
+     "google-ai-studio": "gemini",
++    "gemini-cli": "google-gemini-cli",
++    "google-cli": "google-gemini-cli",
++    "google-oauth": "google-gemini-cli",
+     "x-ai": "xai",
+     "x.ai": "xai",
+     "grok": "xai",
+@@ -201,6 +204,18 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
+     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+     return bare == "trinity-large-thinking"
+ 
++def _is_openai_reasoning_model(model: Optional[str]) -> bool:
++    """True for OpenAI reasoning models that reject temperature."""
++    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
++    if bare.startswith("gpt-"):
++        parts = bare.split("-")
++        if len(parts) >= 2 and parts[1].split(".", 1)[0].isdigit():
++            try:
++                return int(parts[1].split(".", 1)[0]) >= 5
++            except ValueError:
++                return False
++    return bare.startswith(("o1", "o3", "o4"))
++
+ 
+ def _fixed_temperature_for_model(
+     model: Optional[str],
+@@ -219,6 +234,9 @@ def _fixed_temperature_for_model(
+     if _is_kimi_model(model):
+         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+         return OMIT_TEMPERATURE
++    if _is_openai_reasoning_model(model):
++        logger.debug("Omitting temperature for OpenAI reasoning model %r", model)
++        return OMIT_TEMPERATURE
+     if _is_arcee_trinity_thinking(model):
+         return 0.5
+     return None
+@@ -260,6 +278,7 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
+ # profiles). New providers should set default_aux_model on their profile instead.
+ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
+     "gemini": "gemini-3-flash-preview",
++    "google-gemini-cli": "gemini-3-flash-preview",
+     "zai": "glm-4.5-flash",
+     "kimi-coding": "kimi-k2-turbo-preview",
+     "stepfun": "step-3.5-flash",
+@@ -288,6 +307,7 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
+ _PROVIDER_VISION_MODELS: Dict[str, str] = {
+     "xiaomi": "mimo-v2.5",
+     "zai": "glm-5v-turbo",
++    "google-gemini-cli": "gemini-3-flash-preview",
+ }
+ 
+ # Providers whose endpoint does not accept image input, even though the
+@@ -612,11 +632,35 @@ class _CodexCompletionsAdapter:
+             content = msg.get("content") or ""
+             if role == "system":
+                 instructions = content if isinstance(content, str) else str(content)
+-            else:
++                continue
++            # Responses API does not accept role="tool". Convert chat.completions
++            # tool result messages into function_call_output items.
++            if role == "tool":
++                tool_id = msg.get("tool_call_id", "") or ""
++                output_text = content if isinstance(content, str) else str(content)
+                 input_msgs.append({
+-                    "role": role,
+-                    "content": _convert_content_for_responses(content),
++                    "type": "function_call_output",
++                    "call_id": tool_id,
++                    "output": output_text,
+                 })
++                continue
++            # Assistant messages with tool_calls: emit each call as a
++            # function_call item alongside any assistant text.
++            if role == "assistant" and msg.get("tool_calls"):
++                for tc in msg.get("tool_calls") or []:
++                    fn = tc.get("function") or {}
++                    input_msgs.append({
++                        "type": "function_call",
++                        "call_id": tc.get("id", "") or "",
++                        "name": fn.get("name", "") or "",
++                        "arguments": fn.get("arguments", "") or "",
++                    })
++                if not content:
++                    continue
++            input_msgs.append({
++                "role": role,
++                "content": _convert_content_for_responses(content),
++            })
+ 
+         resp_kwargs: Dict[str, Any] = {
+             "model": model,
+@@ -1444,7 +1488,10 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
+     # _NOUS_MODEL (google/gemini-3-flash-preview) when the Portal is unreachable
+     # or returns a null recommendation for this task type.
+     model = _NOUS_MODEL
++    use_portal_recommendation = not (isinstance(nous, dict) and nous.get("source") == "pool")
+     try:
++        if not use_portal_recommendation:
++            raise RuntimeError("pool credential uses static auxiliary model")
+         from hermes_cli.models import get_nous_recommended_aux_model
+         recommended = get_nous_recommended_aux_model(vision=vision)
+         if recommended:
+@@ -2001,6 +2048,25 @@ def _is_rate_limit_error(exc: Exception) -> bool:
+     return False
+ 
+ 
++def _is_capacity_or_rate_error(exc: Exception) -> bool:
++    """Detect transient capacity/rate-limit failures that can use fallbacks."""
++    status = getattr(exc, "status_code", None)
++    err_lower = str(exc).lower()
++    if status == 429:
++        return True
++    if status in (500, 502, 503, 504):
++        if any(kw in err_lower for kw in (
++            "overloaded", "capacity", "temporarily unavailable",
++            "rate limit", "quota exceeded", "resource exhausted",
++            "too many requests", "try again later",
++        )):
++            return True
++    return any(kw in err_lower for kw in (
++        "rate limit", "too many requests", "overloaded", "capacity exhausted",
++        "temporarily unavailable", "resource exhausted", "quota exceeded",
++    ))
++
++
+ def _is_connection_error(exc: Exception) -> bool:
+     """Detect connection/network errors that warrant provider fallback.
+ 
+@@ -2393,6 +2459,26 @@ def _refresh_provider_credentials(provider: str) -> bool:
+     return False
+ 
+ 
++def _get_task_fallback_specs(task: str = None) -> list:
++    """Return normalized auxiliary.<task>.fallbacks entries from config.yaml."""
++    task_config = _get_auxiliary_task_config(task)
++    raw = task_config.get("fallbacks")
++    if not isinstance(raw, list):
++        return []
++    specs = []
++    for entry in raw:
++        if isinstance(entry, str):
++            provider = entry.strip()
++            if provider:
++                specs.append({"provider": provider})
++        elif isinstance(entry, dict):
++            provider = str(entry.get("provider") or "").strip()
++            base_url = str(entry.get("base_url") or "").strip()
++            if provider or base_url:
++                specs.append(dict(entry))
++    return specs
++
++
+ def _try_payment_fallback(
+     failed_provider: str,
+     task: str = None,
+@@ -2421,6 +2507,43 @@ def _try_payment_fallback(
+     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
+ 
+     tried = []
++    for spec in _get_task_fallback_specs(task):
++        provider = str(spec.get("provider") or "auto").strip() or "auto"
++        base_url = str(spec.get("base_url") or "").strip() or None
++        api_key = str(spec.get("api_key") or "").strip() or None
++        api_mode = str(spec.get("api_mode") or "").strip() or None
++        model = str(spec.get("model") or "").strip() or None
++        label = provider if not base_url else f"custom:{base_url}"
++        if _normalize_aux_provider(provider) in skip_chain_labels:
++            continue
++        try:
++            if task == "vision":
++                effective_provider, client, resolved_model = resolve_vision_provider_client(
++                    provider=provider,
++                    model=model,
++                    base_url=base_url,
++                    api_key=api_key,
++                    async_mode=False,
++                )
++                label = effective_provider or label
++            else:
++                client, resolved_model = _get_cached_client(
++                    "custom" if base_url else provider,
++                    model,
++                    base_url=base_url,
++                    api_key=api_key,
++                    api_mode=api_mode,
++                )
++            if client is not None:
++                logger.info(
++                    "Auxiliary %s: %s on %s - falling back to configured %s (%s)",
++                    task or "call", reason, failed_provider, label, resolved_model or "default",
++                )
++                return client, resolved_model, label
++        except Exception as exc:
++            logger.debug("Auxiliary %s fallback %s unavailable: %s", task or "call", label, exc)
++            tried.append(f"{label} (unavailable)")
++
+     for label, try_fn in _get_provider_chain():
+         if label in skip_chain_labels:
+             continue
+@@ -4302,7 +4425,7 @@ def call_llm(
+ 
+         # ── Same-provider credential-pool recovery ─────────────────────
+         pool_provider = _recoverable_pool_provider(resolved_provider, client)
+-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
++        if pool_provider and not _get_task_fallback_specs(task) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+             recovery_err = first_err
+             if _is_rate_limit_error(first_err):
+                 try:
+@@ -4355,12 +4478,13 @@ def call_llm(
+             _is_payment_error(first_err)
+             or _is_connection_error(first_err)
+             or _is_rate_limit_error(first_err)
++            or _is_capacity_or_rate_error(first_err)
+         )
+         # Only try alternative providers when the user didn't explicitly
+         # configure this task's provider.  Explicit provider = hard constraint;
+         # auto (the default) = best-effort fallback chain.  (#7559)
+         is_auto = resolved_provider in {"auto", "", None}
+-        if should_fallback and is_auto:
++        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
+             if _is_payment_error(first_err):
+                 reason = "payment error"
+                 # Resolve the actual provider label (resolved_provider may be
+@@ -4651,7 +4775,7 @@ async def async_call_llm(
+ 
+         # ── Same-provider credential-pool recovery (mirrors sync) ─────
+         pool_provider = _recoverable_pool_provider(resolved_provider, client)
+-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
++        if pool_provider and not _get_task_fallback_specs(task) and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+             recovery_err = first_err
+             if _is_rate_limit_error(first_err):
+                 try:
+@@ -4687,9 +4811,10 @@ async def async_call_llm(
+             _is_payment_error(first_err)
+             or _is_connection_error(first_err)
+             or _is_rate_limit_error(first_err)
++            or _is_capacity_or_rate_error(first_err)
+         )
+         is_auto = resolved_provider in {"auto", "", None}
+-        if should_fallback and is_auto:
++        if should_fallback and (is_auto or _get_task_fallback_specs(task)):
+             if _is_payment_error(first_err):
+                 reason = "payment error"
+                 _mark_provider_unhealthy(
+diff --git a/agent/gemini_cloudcode_adapter.py b/agent/gemini_cloudcode_adapter.py
+index 5bc42e3a..ea530c6f 100644
+--- a/agent/gemini_cloudcode_adapter.py
++++ b/agent/gemini_cloudcode_adapter.py
+@@ -28,6 +28,8 @@ reverse-engineered from the opencode-gemini-auth and clawdbot implementations.
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import base64
+ import json
+ import logging
+ import time
+@@ -73,16 +75,59 @@ def _coerce_content_to_text(content: Any) -> str:
+         for p in content:
+             if isinstance(p, str):
+                 pieces.append(p)
+-            elif isinstance(p, dict):
+-                if p.get("type") == "text" and isinstance(p.get("text"), str):
+-                    pieces.append(p["text"])
+-                # Multimodal (image_url, etc.) — stub for now; log and skip
+-                elif p.get("type") in {"image_url", "input_audio"}:
+-                    logger.debug("Dropping multimodal part (not yet supported): %s", p.get("type"))
++            elif isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
++                pieces.append(p["text"])
+         return "\n".join(pieces)
+     return str(content)
+ 
+ 
++def _extract_content_parts(content: Any) -> List[Dict[str, Any]]:
++    """Convert OpenAI text/image content parts to Gemini parts.
++
++    Vision tools pass images as data URLs in OpenAI's ``image_url`` format.
++    Code Assist accepts the same Gemini ``inlineData`` parts as the public
++    Gemini API, so keep image bytes instead of silently dropping them.
++    """
++    if not isinstance(content, list):
++        text = _coerce_content_to_text(content)
++        return [{"text": text}] if text else []
++
++    parts: List[Dict[str, Any]] = []
++    for item in content:
++        if isinstance(item, str):
++            if item:
++                parts.append({"text": item})
++            continue
++        if not isinstance(item, dict):
++            continue
++        ptype = item.get("type")
++        if ptype == "text":
++            text = item.get("text")
++            if isinstance(text, str) and text:
++                parts.append({"text": text})
++            continue
++        if ptype == "image_url":
++            image_url = item.get("image_url") or {}
++            url = image_url.get("url") if isinstance(image_url, dict) else ""
++            if not isinstance(url, str) or not url.startswith("data:"):
++                logger.debug("Dropping non-data image_url part for Code Assist")
++                continue
++            try:
++                header, encoded = url.split(",", 1)
++                mime = header.split(":", 1)[1].split(";", 1)[0]
++                raw = base64.b64decode(encoded)
++            except Exception:
++                logger.debug("Dropping invalid data image_url part for Code Assist", exc_info=True)
++                continue
++            parts.append({
++                "inlineData": {
++                    "mimeType": mime,
++                    "data": base64.b64encode(raw).decode("ascii"),
++                }
++            })
++    return parts
++
++
+ def _translate_tool_call_to_gemini(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+     """OpenAI tool_call -> Gemini functionCall part."""
+     fn = tool_call.get("function") or {}
+@@ -155,11 +200,7 @@ def _build_gemini_contents(
+             continue
+ 
+         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
+-        parts: List[Dict[str, Any]] = []
+-
+-        text = _coerce_content_to_text(msg.get("content"))
+-        if text:
+-            parts.append({"text": text})
++        parts: List[Dict[str, Any]] = _extract_content_parts(msg.get("content"))
+ 
+         # Assistant messages can carry tool_calls
+         tool_calls = msg.get("tool_calls") or []
+@@ -577,11 +618,40 @@ class _GeminiChatCompletions:
+         return self._client._create_chat_completion(**kwargs)
+ 
+ 
++class _AsyncGeminiChatCompletions:
++    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
++        self._client = client
++
++    async def create(self, **kwargs: Any) -> Any:
++        return await self._client._create_chat_completion(**kwargs)
++
++
+ class _GeminiChatNamespace:
+     def __init__(self, client: "GeminiCloudCodeClient"):
+         self.completions = _GeminiChatCompletions(client)
+ 
+ 
++class _AsyncGeminiChatNamespace:
++    def __init__(self, client: "AsyncGeminiCloudCodeClient"):
++        self.completions = _AsyncGeminiChatCompletions(client)
++
++
++class AsyncGeminiCloudCodeClient:
++    """Async facade over GeminiCloudCodeClient using a worker thread."""
++
++    def __init__(self, sync_client: "GeminiCloudCodeClient"):
++        self._sync_client = sync_client
++        self.api_key = sync_client.api_key
++        self.base_url = sync_client.base_url
++        self.chat = _AsyncGeminiChatNamespace(self)
++
++    async def _create_chat_completion(self, **kwargs: Any) -> Any:
++        return await asyncio.to_thread(self._sync_client._create_chat_completion, **kwargs)
++
++    async def close(self) -> None:
++        await asyncio.to_thread(self._sync_client.close)
++
++
+ class GeminiCloudCodeClient:
+     """Minimal OpenAI-SDK-compatible facade over Code Assist v1internal."""
+ 
+diff --git a/agent/gemini_native_adapter.py b/agent/gemini_native_adapter.py
+index b0d90337..f57a14f2 100644
+--- a/agent/gemini_native_adapter.py
++++ b/agent/gemini_native_adapter.py
+@@ -679,21 +679,7 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
+     finish_reason_raw = str(cand.get("finishReason") or "")
+     if finish_reason_raw:
+         mapped = "tool_calls" if tool_call_indices else _map_gemini_finish_reason(finish_reason_raw)
+-        finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped)
+-        # Attach usage from this event's usageMetadata so the streaming
+-        # loop in run_agent.py can record token counts (mirrors the
+-        # non-streaming path in translate_gemini_response).
+-        usage_meta = event.get("usageMetadata") or {}
+-        if usage_meta:
+-            finish_chunk.usage = SimpleNamespace(
+-                prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
+-                completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
+-                total_tokens=int(usage_meta.get("totalTokenCount") or 0),
+-                prompt_tokens_details=SimpleNamespace(
+-                    cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
+-                ),
+-            )
+-        chunks.append(finish_chunk)
++        chunks.append(_make_stream_chunk(model=model, finish_reason=mapped))
+     return chunks
+ 
+ 
+@@ -848,11 +834,13 @@ class GeminiNativeClient:
+         self.close()
+ 
+     def _headers(self) -> Dict[str, str]:
++        # Keep transport identity generic: do not brand Gemini API fallback
++        # requests as Hermes.  Callers may still pass explicit default_headers
++        # if they need provider-specific metadata.
+         headers = {
+             "Content-Type": "application/json",
+             "Accept": "application/json",
+             "x-goog-api-key": self.api_key,
+-            "User-Agent": "hermes-agent (gemini-native)",
+         }
+         headers.update(self._default_headers)
+         return headers
+@@ -945,12 +933,6 @@ class AsyncGeminiNativeClient:
+         self.api_key = sync_client.api_key
+         self.base_url = sync_client.base_url
+         self.chat = _AsyncGeminiChatNamespace(self)
+-        # Expose the underlying sync client as _real_client so the auxiliary
+-        # cache's eviction-by-leaf-client helper (#23482) can find and drop
+-        # this async entry when the sync GeminiNativeClient is poisoned.
+-        # GeminiNativeClient is itself the leaf (no OpenAI client beneath
+-        # it), so we point at the sync_client directly.
+-        self._real_client = sync_client
+ 
+     async def _create_chat_completion(self, **kwargs: Any) -> Any:
+         stream = bool(kwargs.get("stream"))
+diff --git a/agent/image_gen_provider.py b/agent/image_gen_provider.py
+index 47f65c1b..c05562c7 100644
+--- a/agent/image_gen_provider.py
++++ b/agent/image_gen_provider.py
+@@ -76,6 +76,17 @@ class ImageGenProvider(abc.ABC):
+         """
+         return True
+ 
++    @property
++    def supports_references(self) -> bool:
++        """True when :meth:`generate` accepts a ``references`` kwarg.
++
++        Providers opt in explicitly. The ``image_generate`` dispatcher uses
++        this to forward local image paths only to capable backends and to fail
++        early with ``references_unsupported`` instead of silently dropping
++        reference images.
++        """
++        return False
++
+     def list_models(self) -> List[Dict[str, Any]]:
+         """Return catalog entries for ``hermes tools`` model picker.
+ 
+@@ -140,6 +151,10 @@ class ImageGenProvider(abc.ABC):
+         or :func:`error_response`. ``kwargs`` may contain forward-compat
+         parameters future versions of the schema will expose — implementations
+         should ignore unknown keys.
++
++        Known optional kwargs:
++        - ``references``: ``list[str]`` of local image file paths, forwarded
++          only when :attr:`supports_references` is True.
+         """
+ 
+ 
+diff --git a/agent/title_generator.py b/agent/title_generator.py
+index a7f1e158..66ffee53 100644
+--- a/agent/title_generator.py
++++ b/agent/title_generator.py
+@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
+ """
+ 
+ import logging
++import re
+ import threading
+ from typing import Callable, Optional
+ 
+@@ -17,7 +18,6 @@ logger = logging.getLogger(__name__)
+ # so silent-drops (e.g. OpenRouter 402 exhausting the fallback chain)
+ # become visible instead of piling up as NULL session titles.
+ FailureCallback = Callable[[str, BaseException], None]
+-TitleCallback = Callable[[str], None]
+ 
+ _TITLE_PROMPT = (
+     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
+@@ -25,6 +25,30 @@ _TITLE_PROMPT = (
+     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+ )
+ 
++_WORD_RE = re.compile(r"[\w\u00c0-\u024f]+(?:['’][\w\u00c0-\u024f]+)?", re.UNICODE)
++_DROP_TRAILING = {"keep", "going", "again", "please", "pls"}
++
++
++def _fallback_title_from_prompt(user_message: str) -> Optional[str]:
++    """Deterministic last-resort title when the auxiliary model returns empty content."""
++    words = _WORD_RE.findall(user_message or "")
++    cleaned = []
++    for word in words:
++        lowered = word.lower()
++        if lowered in {"hermes", "asa", "bot"}:
++            continue
++        cleaned.append(word)
++        if len(cleaned) >= 8:
++            break
++    while cleaned and cleaned[-1].lower() in _DROP_TRAILING:
++        cleaned.pop()
++    if not cleaned:
++        return None
++    title = " ".join(cleaned[:8]).strip()
++    if not title:
++        return None
++    return title[:77].rstrip() + ("..." if len(title) > 77 else "")
++
+ 
+ def generate_title(
+     user_message: str,
+@@ -54,15 +78,28 @@ def generate_title(
+     ]
+ 
+     try:
++        # Some auxiliary providers expose reasoning/thinking models behind
++        # cheap aliases. With too small a completion budget they can finish
++        # with `length` and an empty visible message, which made Discord
++        # thread auto-rename silently skip. Keep the request small, but give
++        # these models enough room to emit the actual title.
+         response = call_llm(
+             task="title_generation",
+             messages=messages,
+-            max_tokens=500,
++            max_tokens=2000,
+             temperature=0.3,
+             timeout=timeout,
+             main_runtime=main_runtime,
+         )
+-        title = (response.choices[0].message.content or "").strip()
++        choice = response.choices[0]
++        title = (choice.message.content or "").strip()
++        if not title:
++            logger.warning(
++                "Title generation returned empty content: finish_reason=%r model/task=%s",
++                getattr(choice, "finish_reason", None),
++                "title_generation",
++            )
++            title = _fallback_title_from_prompt(user_message) or ""
+         # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
+         title = title.strip('"\'')
+         if title.lower().startswith("title:"):
+@@ -91,7 +128,6 @@ def auto_title_session(
+     assistant_response: str,
+     failure_callback: Optional[FailureCallback] = None,
+     main_runtime: dict = None,
+-    title_callback: Optional[TitleCallback] = None,
+ ) -> None:
+     """Generate and set a session title if one doesn't already exist.
+ 
+@@ -121,11 +157,6 @@ def auto_title_session(
+     try:
+         session_db.set_session_title(session_id, title)
+         logger.debug("Auto-generated session title: %s", title)
+-        if title_callback is not None:
+-            try:
+-                title_callback(title)
+-            except Exception:
+-                logger.debug("Auto-title callback failed", exc_info=True)
+     except Exception as e:
+         logger.debug("Failed to set auto-generated title: %s", e)
+ 
+@@ -138,7 +169,6 @@ def maybe_auto_title(
+     conversation_history: list,
+     failure_callback: Optional[FailureCallback] = None,
+     main_runtime: dict = None,
+-    title_callback: Optional[TitleCallback] = None,
+ ) -> None:
+     """Fire-and-forget title generation after the first exchange.
+ 
+@@ -160,11 +190,7 @@ def maybe_auto_title(
+     thread = threading.Thread(
+         target=auto_title_session,
+         args=(session_db, session_id, user_message, assistant_response),
+-        kwargs={
+-            "failure_callback": failure_callback,
+-            "main_runtime": main_runtime,
+-            "title_callback": title_callback,
+-        },
++        kwargs={"failure_callback": failure_callback, "main_runtime": main_runtime},
+         daemon=True,
+         name="auto-title",
+     )
+diff --git a/gateway/config.py b/gateway/config.py
+index 16e2662e..3c437eb7 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -859,6 +859,15 @@ def load_gateway_config() -> GatewayConfig:
+                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
+                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
++                # Auto-rename of Hermes-owned threads after first reply.
++                # See gateway/platforms/discord_thread_rename.py for the
++                # supported delay modes and length cap.
++                if "auto_rename_threads" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_THREADS"):
++                    os.environ["DISCORD_AUTO_RENAME_THREADS"] = str(discord_cfg["auto_rename_threads"]).lower()
++                if "auto_rename_max_length" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_MAX_LENGTH"):
++                    os.environ["DISCORD_AUTO_RENAME_MAX_LENGTH"] = str(discord_cfg["auto_rename_max_length"])
++                if "auto_rename_delay" in discord_cfg and not os.getenv("DISCORD_AUTO_RENAME_DELAY"):
++                    os.environ["DISCORD_AUTO_RENAME_DELAY"] = str(discord_cfg["auto_rename_delay"])
+                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
+                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
+                 # ignored_channels: channels where bot never responds (even when mentioned)
+diff --git a/gateway/platforms/discord.py b/gateway/platforms/discord.py
+index 1817ece1..f7125d9e 100644
+--- a/gateway/platforms/discord.py
++++ b/gateway/platforms/discord.py
+@@ -50,6 +50,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+ from gateway.config import Platform, PlatformConfig
+ import re
+ 
++from gateway.platforms.discord_thread_rename import (
++    load_config_from_env as _load_auto_rename_config,
++    maybe_auto_rename_thread,
++    strip_discord_mentions as _strip_discord_mentions,
++)
+ from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
+ from utils import atomic_json_write
+ from gateway.platforms.base import (
+@@ -86,32 +91,8 @@ def _clean_discord_id(entry: str) -> str:
+ 
+ 
+ def check_discord_requirements() -> bool:
+-    """Check if Discord dependencies are available.
+-
+-    Lazy-installs discord.py via ``tools.lazy_deps.ensure("platform.discord")``
+-    on first call if not present. After successful install, re-binds module
+-    globals so ``DISCORD_AVAILABLE`` becomes True.
+-    """
+-    global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
+-    if DISCORD_AVAILABLE:
+-        return True
+-    try:
+-        from tools.lazy_deps import ensure as _lazy_ensure
+-        _lazy_ensure("platform.discord", prompt=False)
+-    except Exception:
+-        return False
+-    try:
+-        import discord as _discord
+-        from discord import Message as _DM, Intents as _Intents
+-        from discord.ext import commands as _commands
+-    except ImportError:
+-        return False
+-    discord = _discord
+-    DiscordMessage = _DM
+-    Intents = _Intents
+-    commands = _commands
+-    DISCORD_AVAILABLE = True
+-    return True
++    """Check if Discord dependencies are available."""
++    return DISCORD_AVAILABLE
+ 
+ 
+ def _build_allowed_mentions():
+@@ -589,6 +570,9 @@ class DiscordAdapter(BasePlatformAdapter):
+         # chunk only, default), "all" (reply-reference on every chunk).
+         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
++        self._auto_rename_cfg = _load_auto_rename_config()
++        self._pending_user_messages: Dict[str, str] = {}
++        self._renamed_threads: set[str] = set()
+ 
+     async def connect(self) -> bool:
+         """Connect to Discord and start receiving events."""
+@@ -1459,6 +1443,15 @@ class DiscordAdapter(BasePlatformAdapter):
+                         raise
+                 message_ids.append(str(msg.id))
+ 
++            thread_cls = getattr(discord, "Thread", None) if discord is not None else None
++            if (
++                self._auto_rename_cfg.enabled
++                and message_ids
++                and thread_cls is not None
++                and isinstance(channel, thread_cls)
++            ):
++                self._schedule_thread_auto_rename(channel, content)
++
+             return SendResult(
+                 success=True,
+                 message_id=message_ids[0] if message_ids else None,
+@@ -1469,6 +1462,37 @@ class DiscordAdapter(BasePlatformAdapter):
+             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+             return SendResult(success=False, error=str(e))
+ 
++    def _schedule_thread_auto_rename(self, thread: Any, assistant_response: str) -> None:
++        """Fire-and-forget: rename an owned thread after the first assistant reply."""
++        thread_id = str(getattr(thread, "id", "") or "")
++        if not thread_id:
++            return
++        if thread_id in self._renamed_threads:
++            return
++        if thread_id not in self._threads:
++            return
++        user_message = self._pending_user_messages.pop(thread_id, None)
++        if not user_message:
++            return
++
++        cfg = self._auto_rename_cfg
++        renamed_threads = self._renamed_threads
++
++        async def _runner():
++            await maybe_auto_rename_thread(
++                thread,
++                user_message,
++                assistant_response,
++                cfg,
++                is_renamed=lambda: thread_id in renamed_threads,
++                on_renamed=lambda _title: renamed_threads.add(thread_id),
++            )
++
++        try:
++            asyncio.create_task(_runner())
++        except RuntimeError:
++            logger.debug("[%s] No event loop available to auto-rename %s", self.name, thread_id)
++
+     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+         """Create a thread post in a forum channel with the message as starter content.
+ 
+@@ -4279,6 +4303,17 @@ class DiscordAdapter(BasePlatformAdapter):
+         # so forum descriptions (e.g. project instructions) appear in the session context.
+         chat_topic = self._get_effective_topic(message.channel, is_thread=is_thread)
+ 
++        if (
++            self._auto_rename_cfg.enabled
++            and is_thread
++            and thread_id
++            and thread_id in self._threads
++            and thread_id not in self._renamed_threads
++        ):
++            captured_prompt = _strip_discord_mentions(normalized_content)
++            if captured_prompt:
++                self._pending_user_messages[thread_id] = captured_prompt
++
+         # Build source
+         guild = getattr(message, "guild", None)
+         source = self.build_source(
+diff --git a/gateway/platforms/discord_thread_rename.py b/gateway/platforms/discord_thread_rename.py
+new file mode 100755
+index 00000000..050b94fd
+--- /dev/null
++++ b/gateway/platforms/discord_thread_rename.py
+@@ -0,0 +1,265 @@
++"""Auto-rename Hermes Discord threads with a short, conversation-style title.
++
++When Hermes auto-creates a thread on @mention (or runs inside a thread it
++already participated in), the thread name starts as the raw user prompt
++truncated to 80 chars.  After the first assistant response, this module
++generates a clean 3-8 word title (Claude/ChatGPT style) and renames the
++thread once via Discord's PATCH /channels/{thread_id} endpoint.
++
++Kept deliberately platform-local: the Discord adapter owns the trigger
++and state, so no broader gateway/core change is required.  Title
++generation reuses ``agent.title_generator.generate_title`` (cheap
++auxiliary LLM path).
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import re
++from dataclasses import dataclass
++from typing import Any, Awaitable, Callable, Optional
++
++logger = logging.getLogger(__name__)
++
++# Discord enforces a 100-char hard limit on channel/thread names.
++DISCORD_MAX_THREAD_NAME = 100
++
++# Default cap for the generated title — keeps thread lists readable.
++DEFAULT_MAX_LENGTH = 60
++
++# Modes for when to fire the rename.  Only one mode is supported today;
++# the field exists so future delays (after_first_user_response, after_n
++# exchanges, ...) slot in without breaking config consumers.
++DELAY_AFTER_FIRST_ASSISTANT_RESPONSE = "after_first_assistant_response"
++
++_VALID_DELAYS = {DELAY_AFTER_FIRST_ASSISTANT_RESPONSE}
++
++# Characters that look noisy in a thread title.
++_TRAILING_PUNCTUATION = ".!?,;:\u2026"
++
++# Discord channel/thread names cannot contain control chars; collapse
++# any whitespace run (including newlines, tabs) into a single space.
++_WS_RUN = re.compile(r"\s+")
++
++# Discord mention syntax: <@123>, <@!123>, <@&123>, <#123>.  Same regex
++# chain used by ``DiscordAdapter._auto_create_thread`` to seed the
++# initial thread name — keep them in lockstep so ``looks_like_raw_prompt``
++# works for prompts that contain user/role/channel mentions.
++_DISCORD_MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>")
++
++
++def strip_discord_mentions(content: str) -> str:
++    """Strip ``<@id>``/``<@!id>``/``<@&id>``/``<#id>`` mentions and collapse whitespace.
++
++    Mirrors the normalization in ``DiscordAdapter._auto_create_thread``
++    so the prompt we capture for auto-rename matches the seed used to
++    name the thread.
++    """
++    if not content:
++        return ""
++    cleaned = _DISCORD_MENTION_RE.sub("", content)
++    return _WS_RUN.sub(" ", cleaned).strip()
++
++
++@dataclass(frozen=True)
++class DiscordAutoRenameConfig:
++    """Resolved config for the auto-rename feature."""
++
++    enabled: bool = False
++    max_length: int = DEFAULT_MAX_LENGTH
++    delay: str = DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    @property
++    def effective_max_length(self) -> int:
++        """Clamp the user-provided cap to Discord's hard limit."""
++        if self.max_length <= 0:
++            return DEFAULT_MAX_LENGTH
++        return min(self.max_length, DISCORD_MAX_THREAD_NAME)
++
++
++def load_config_from_env(env: Optional[dict] = None) -> DiscordAutoRenameConfig:
++    """Build a config from environment variables.
++
++    Env vars (all optional):
++      DISCORD_AUTO_RENAME_THREADS    bool, default ``true``
++      DISCORD_AUTO_RENAME_MAX_LENGTH int,  default ``60``
++      DISCORD_AUTO_RENAME_DELAY      str,  default ``after_first_assistant_response``
++    """
++    src = env if env is not None else os.environ
++
++    raw_enabled = src.get("DISCORD_AUTO_RENAME_THREADS", "true")
++    enabled = str(raw_enabled).strip().lower() in ("1", "true", "yes", "on")
++
++    raw_len = src.get("DISCORD_AUTO_RENAME_MAX_LENGTH", "")
++    try:
++        max_length = int(raw_len) if str(raw_len).strip() else DEFAULT_MAX_LENGTH
++    except ValueError:
++        max_length = DEFAULT_MAX_LENGTH
++
++    raw_delay = (src.get("DISCORD_AUTO_RENAME_DELAY") or DELAY_AFTER_FIRST_ASSISTANT_RESPONSE).strip()
++    delay = raw_delay if raw_delay in _VALID_DELAYS else DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    return DiscordAutoRenameConfig(enabled=enabled, max_length=max_length, delay=delay)
++
++
++def sanitize_title(raw: str, max_length: int = DEFAULT_MAX_LENGTH) -> str:
++    """Clean an LLM-generated title down to a Discord-safe thread name.
++
++    - Strips surrounding quotes/whitespace and a leading "Title:" prefix.
++    - Collapses internal whitespace runs into single spaces.
++    - Trims trailing punctuation.
++    - Truncates to ``max_length`` (clamped to Discord's 100-char limit)
++      on a word boundary when possible, with a trailing ellipsis.
++    Returns ``""`` for empty / unsalvageable input — callers should treat
++    that as "skip rename".
++    """
++    if not raw:
++        return ""
++
++    title = raw.strip().strip("\"'\u201c\u201d\u2018\u2019")
++    if title.lower().startswith("title:"):
++        title = title[6:].strip().strip("\"'\u201c\u201d\u2018\u2019")
++
++    # Collapse all whitespace (incl. newlines) into single spaces.
++    title = _WS_RUN.sub(" ", title).strip()
++
++    # Strip trailing punctuation (a single pass is enough since we
++    # already collapsed whitespace).
++    title = title.rstrip(_TRAILING_PUNCTUATION).strip()
++
++    if not title:
++        return ""
++
++    cap = max(1, min(max_length, DISCORD_MAX_THREAD_NAME))
++    if len(title) <= cap:
++        return title
++
++    # Truncate; prefer a word boundary so we don't chop a word in half.
++    cut = title[: cap - 1]
++    space = cut.rfind(" ")
++    if space >= max(10, cap // 2):
++        cut = cut[:space]
++    return cut.rstrip(_TRAILING_PUNCTUATION + " ") + "\u2026"
++
++
++def looks_like_raw_prompt(current_name: str, original_prompt: str) -> bool:
++    """Heuristic: does ``current_name`` still match the raw user prompt?
++
++    The Discord adapter seeds new threads with the first ~80 chars of the
++    user's mention-stripped message (see ``DiscordAdapter._auto_create_thread``).
++    If the current name still matches that seed, no human/agent has
++    renamed it yet — safe to overwrite.
++    """
++    if not current_name or not original_prompt:
++        return False
++    cur = _WS_RUN.sub(" ", current_name).strip()
++    seed = _WS_RUN.sub(" ", original_prompt).strip()
++    if not cur or not seed:
++        return False
++    if cur == seed:
++        return True
++    # The adapter may have appended an ellipsis when truncating to 80
++    # chars (``thread_name[:77] + "..."``).  Normalise that off.
++    cur_no_ell = cur.rstrip(".\u2026").rstrip()
++    seed_prefix = seed[: len(cur_no_ell)]
++    return bool(cur_no_ell) and cur_no_ell == seed_prefix.strip()
++
++
++async def maybe_auto_rename_thread(
++    thread: Any,
++    user_message: str,
++    assistant_response: str,
++    config: DiscordAutoRenameConfig,
++    *,
++    is_renamed: Callable[[], bool] = lambda: False,
++    on_renamed: Callable[[str], None] = lambda _title: None,
++    title_generator: Optional[Callable[[str, str], Optional[str]]] = None,
++    edit_runner: Optional[Callable[[Any, str], Awaitable[None]]] = None,
++) -> Optional[str]:
++    """Generate a title and rename a Hermes-owned Discord thread.
++
++    Returns the applied title on success, ``None`` if skipped or failed.
++    All failure paths log at WARNING/DEBUG and never raise — the caller
++    (a fire-and-forget background task in the adapter) must keep the
++    user-facing reply uninterrupted.
++
++    Injection points (all optional, real defaults):
++      title_generator(user, assistant) -> Optional[str]
++        Defaults to ``agent.title_generator.generate_title``.
++      edit_runner(thread, name) -> Awaitable[None]
++        Defaults to ``await thread.edit(name=name, reason=...)``.
++    """
++    if not config.enabled:
++        return None
++    if config.delay != DELAY_AFTER_FIRST_ASSISTANT_RESPONSE:
++        # Reserved for future strategies; treat unknown delays as "skip"
++        # rather than silently firing on the wrong trigger.
++        logger.debug("Discord auto-rename: unsupported delay %r, skipping", config.delay)
++        return None
++    if thread is None:
++        return None
++    if not user_message or not assistant_response:
++        return None
++
++    try:
++        if is_renamed():
++            return None
++    except Exception:
++        # is_renamed should never raise; if it does, fail open (skip)
++        # rather than risk a duplicate rename.
++        return None
++
++    current_name = getattr(thread, "name", "") or ""
++    if not looks_like_raw_prompt(current_name, user_message):
++        # User already picked a real name OR a previous run already set
++        # one.  Don't stomp on it.
++        logger.debug(
++            "Discord auto-rename: thread name %r no longer matches raw prompt — skipping",
++            current_name,
++        )
++        return None
++
++    if title_generator is None:
++        from agent.title_generator import generate_title as title_generator  # noqa: PLC0415
++
++    # The default ``generate_title`` round-trips to the auxiliary LLM
++    # synchronously (blocking I/O).  Push it onto a worker thread so we
++    # don't stall the Discord event loop for other gateway events while
++    # the title is being generated.
++    try:
++        raw_title = await asyncio.to_thread(title_generator, user_message, assistant_response)
++    except Exception as e:  # pragma: no cover - defensive
++        logger.debug("Discord auto-rename: title generation raised %s", e)
++        return None
++
++    cleaned = sanitize_title(raw_title or "", config.effective_max_length)
++    if not cleaned:
++        logger.debug("Discord auto-rename: empty title after sanitization, skipping")
++        return None
++    if cleaned == current_name:
++        return None
++
++    if edit_runner is None:
++        async def edit_runner(t: Any, name: str) -> None:
++            await t.edit(name=name, reason="Hermes auto-rename")
++
++    try:
++        await edit_runner(thread, cleaned)
++    except Exception as e:
++        logger.warning(
++            "Discord auto-rename: failed to rename thread %s to %r: %s",
++            getattr(thread, "id", "?"), cleaned, e,
++        )
++        return None
++
++    try:
++        on_renamed(cleaned)
++    except Exception:  # pragma: no cover - defensive
++        pass
++    logger.info(
++        "Discord auto-rename: thread %s renamed to %r",
++        getattr(thread, "id", "?"), cleaned,
++    )
++    return cleaned
+diff --git a/plugins/image_gen/openai-codex/__init__.py b/plugins/image_gen/openai-codex/__init__.py
+index ab524dbd..2ee56ebe 100644
+--- a/plugins/image_gen/openai-codex/__init__.py
++++ b/plugins/image_gen/openai-codex/__init__.py
+@@ -15,12 +15,20 @@ Selection precedence for the tier (first hit wins):
+ 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+ 
+ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
++
++Also supports multi-reference input (up to 16 local image paths) via the
++Codex Responses ``input_image`` message content. Callers pass
++``references=[path1, path2, ...]`` and the backend uses them for composition,
++style transfer, and image-to-image edits.
+ """
+ 
+ from __future__ import annotations
+ 
++import base64
+ import logging
+-from typing import Any, Dict, List, Optional, Tuple
++import mimetypes
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+ from agent.image_gen_provider import (
+     DEFAULT_ASPECT_RATIO,
+@@ -62,6 +70,7 @@ _MODELS: Dict[str, Dict[str, Any]] = {
+ }
+ 
+ DEFAULT_MODEL = "gpt-image-2-medium"
++MAX_REFERENCES = 16
+ 
+ _SIZES = {
+     "landscape": "1536x1024",
+@@ -161,7 +170,55 @@ def _build_codex_client():
+         return None
+ 
+ 
+-def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> Optional[str]:
++def _load_reference_images(paths: Sequence[Any]) -> Tuple[List[Tuple[str, str]], Optional[str]]:
++    """Load local reference images into ``(mime, base64)`` pairs."""
++    loaded: List[Tuple[str, str]] = []
++    for raw in paths:
++        if len(loaded) >= MAX_REFERENCES:
++            break
++        if not isinstance(raw, (str, Path)):
++            return loaded, f"reference path must be a string, got {type(raw).__name__}"
++        path = Path(str(raw)).expanduser()
++        if not path.is_file():
++            return loaded, f"reference not found: {path}"
++        mime, _ = mimetypes.guess_type(path.name)
++        if not mime or not mime.startswith("image/"):
++            mime = "image/png"
++        try:
++            encoded = base64.b64encode(path.read_bytes()).decode()
++        except OSError as exc:
++            return loaded, f"could not read reference {path}: {exc}"
++        loaded.append((mime, encoded))
++    return loaded, None
++
++
++def _build_user_content(prompt: str, references: Sequence[Tuple[str, str]]) -> List[Dict[str, Any]]:
++    """Build Responses API user content with optional ``input_image`` items."""
++    if references:
++        labelled = prompt + "\n\n" + "\n".join(
++            f"Reference image {i + 1} is provided below."
++            for i in range(len(references))
++        )
++    else:
++        labelled = prompt
++
++    content: List[Dict[str, Any]] = [{"type": "input_text", "text": labelled}]
++    for mime, b64 in references:
++        content.append({
++            "type": "input_image",
++            "image_url": f"data:{mime};base64,{b64}",
++        })
++    return content
++
++
++def _collect_image_b64(
++    client: Any,
++    *,
++    prompt: str,
++    size: str,
++    quality: str,
++    references: Sequence[Tuple[str, str]] = (),
++) -> Optional[str]:
+     """Stream a Codex Responses image_generation call and return the b64 image."""
+     image_b64: Optional[str] = None
+ 
+@@ -172,7 +229,7 @@ def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) ->
+         input=[{
+             "type": "message",
+             "role": "user",
+-            "content": [{"type": "input_text", "text": prompt}],
++            "content": _build_user_content(prompt, references),
+         }],
+         tools=[{
+             "type": "image_generation",
+@@ -230,6 +287,10 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+     def display_name(self) -> str:
+         return "OpenAI (Codex auth)"
+ 
++    @property
++    def supports_references(self) -> bool:
++        return True
++
+     def is_available(self) -> bool:
+         if not _read_codex_access_token():
+             return False
+@@ -307,6 +368,27 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+         tier_id, meta = _resolve_model()
+         size = _SIZES.get(aspect, _SIZES["square"])
+ 
++        raw_refs = kwargs.get("references") or []
++        if not isinstance(raw_refs, (list, tuple)):
++            return error_response(
++                error=f"references must be a list of image paths, got {type(raw_refs).__name__}",
++                error_type="invalid_argument",
++                provider="openai-codex",
++                model=tier_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++        references, ref_error = _load_reference_images(raw_refs)
++        if ref_error is not None:
++            return error_response(
++                error=ref_error,
++                error_type="invalid_reference",
++                provider="openai-codex",
++                model=tier_id,
++                prompt=prompt,
++                aspect_ratio=aspect,
++            )
++
+         client = _build_codex_client()
+         if client is None:
+             return error_response(
+@@ -324,6 +406,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+                 prompt=prompt,
+                 size=size,
+                 quality=meta["quality"],
++                references=references,
+             )
+         except Exception as exc:
+             logger.debug("Codex image generation failed", exc_info=True)
+@@ -364,7 +447,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
+             prompt=prompt,
+             aspect_ratio=aspect,
+             provider="openai-codex",
+-            extra={"size": size, "quality": meta["quality"]},
++            extra={"size": size, "quality": meta["quality"], "references": len(references)},
+         )
+ 
+ 
+diff --git a/run_agent.py b/run_agent.py
+index 973f0d95..a9bd683e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -10209,6 +10209,7 @@ class AIAgent:
+             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
+             focus_topic,
+         )
++        self._touch_activity("compressing context")
+ 
+         # Notify external memory provider before compression discards context
+         if self._memory_manager:
+diff --git a/scripts/whatsapp-bridge/bridge.js b/scripts/whatsapp-bridge/bridge.js
+index 9ab6118d..a65b6c3f 100644
+--- a/scripts/whatsapp-bridge/bridge.js
++++ b/scripts/whatsapp-bridge/bridge.js
+@@ -23,10 +23,8 @@ import express from 'express';
+ import { Boom } from '@hapi/boom';
+ import pino from 'pino';
+ import path from 'path';
+-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
++import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+ import { randomBytes } from 'crypto';
+-import { execSync } from 'child_process';
+-import { tmpdir } from 'os';
+ import qrcode from 'qrcode-terminal';
+ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+ 
+@@ -45,6 +43,7 @@ const WHATSAPP_DEBUG =
+ 
+ const PORT = parseInt(getArg('port', '3000'), 10);
+ const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
++const QR_FILE = getArg('qr-file', process.env.WHATSAPP_QR_FILE || path.join(SESSION_DIR, '..', 'current-qr.txt'));
+ const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
+ const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
+ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+@@ -55,12 +54,6 @@ const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n──────────
+ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
+   ? DEFAULT_REPLY_PREFIX
+   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
+-const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
+-const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
+-
+-function sleep(ms) {
+-  return new Promise(resolve => setTimeout(resolve, ms));
+-}
+ 
+ function formatOutgoingMessage(message) {
+   // In bot mode, messages come from a different number so the prefix is
+@@ -70,38 +63,6 @@ function formatOutgoingMessage(message) {
+   return REPLY_PREFIX ? `${REPLY_PREFIX}${message}` : message;
+ }
+ 
+-function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
+-  const text = String(message || '');
+-  if (!text) return [];
+-  if (!Number.isFinite(maxLength) || maxLength < 1 || text.length <= maxLength) {
+-    return [text];
+-  }
+-
+-  const chunks = [];
+-  let remaining = text;
+-  while (remaining.length > maxLength) {
+-    let splitAt = remaining.lastIndexOf('\n', maxLength);
+-    if (splitAt < Math.floor(maxLength / 2)) {
+-      splitAt = remaining.lastIndexOf(' ', maxLength);
+-    }
+-    if (splitAt < 1) splitAt = maxLength;
+-
+-    chunks.push(remaining.slice(0, splitAt).trimEnd());
+-    remaining = remaining.slice(splitAt).trimStart();
+-  }
+-  if (remaining) chunks.push(remaining);
+-  return chunks;
+-}
+-
+-function trackSentMessageId(sent) {
+-  if (sent?.key?.id) {
+-    recentlySentIds.add(sent.key.id);
+-    if (recentlySentIds.size > MAX_RECENT_IDS) {
+-      recentlySentIds.delete(recentlySentIds.values().next().value);
+-    }
+-  }
+-}
+-
+ function normalizeWhatsAppId(value) {
+   if (!value) return '';
+   return String(value).replace(':', '@');
+@@ -187,6 +148,7 @@ async function startSocket() {
+     const { connection, lastDisconnect, qr } = update;
+ 
+     if (qr) {
++      try { writeFileSync(QR_FILE, qr, 'utf8'); } catch {}
+       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
+       qrcode.generate(qr, { small: true });
+       console.log('\nWaiting for scan...\n');
+@@ -267,34 +229,17 @@ async function startSocket() {
+         if (!isSelfChat) continue;
+       }
+ 
+-      // Handle !fromMe messages (from other people) based on mode.
+-      // Self-chat mode only responds to the user's own messages to
+-      // themselves — stranger DMs / group pings must never reach the
+-      // Python gateway, otherwise a pairing-code reply fires in response
+-      // to arbitrary incoming messages (#8389).
+-      if (!msg.key.fromMe) {
+-        if (WHATSAPP_MODE === 'self-chat') {
+-          try {
+-            console.log(JSON.stringify({
+-              event: 'ignored',
+-              reason: 'self_chat_mode_rejects_non_self',
+-              chatId,
+-              senderId,
+-            }));
+-          } catch {}
+-          continue;
+-        }
+-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+-          try {
+-            console.log(JSON.stringify({
+-              event: 'ignored',
+-              reason: 'allowlist_mismatch',
+-              chatId,
+-              senderId,
+-            }));
+-          } catch {}
+-          continue;
+-        }
++      // Check allowlist for messages from others (resolve LID ↔ phone aliases)
++      if (!msg.key.fromMe && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
++        try {
++          console.log(JSON.stringify({
++            event: 'ignored',
++            reason: 'allowlist_mismatch',
++            chatId,
++            senderId,
++          }));
++        } catch {}
++        continue;
+       }
+ 
+       const messageContent = getMessageContent(msg);
+@@ -478,22 +423,17 @@ app.post('/send', async (req, res) => {
+   }
+ 
+   try {
+-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+-    const messageIds = [];
+-    for (let i = 0; i < chunks.length; i += 1) {
+-      const sent = await sock.sendMessage(chatId, { text: chunks[i] });
+-      trackSentMessageId(sent);
+-      if (sent?.key?.id) messageIds.push(sent.key.id);
+-      if (chunks.length > 1 && i < chunks.length - 1) {
+-        await sleep(CHUNK_DELAY_MS);
++    const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) });
++
++    // Track sent message ID to prevent echo-back loops
++    if (sent?.key?.id) {
++      recentlySentIds.add(sent.key.id);
++      if (recentlySentIds.size > MAX_RECENT_IDS) {
++        recentlySentIds.delete(recentlySentIds.values().next().value);
+       }
+     }
+ 
+-    res.json({
+-      success: true,
+-      messageId: messageIds[messageIds.length - 1],
+-      messageIds,
+-    });
++    res.json({ success: true, messageId: sent?.key?.id });
+   } catch (err) {
+     res.status(500).json({ error: err.message });
+   }
+@@ -512,22 +452,8 @@ app.post('/edit', async (req, res) => {
+ 
+   try {
+     const key = { id: messageId, fromMe: true, remoteJid: chatId };
+-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+-    const messageIds = [];
+-
+-    await sock.sendMessage(chatId, { text: chunks[0], edit: key });
+-    if (chunks.length > 1) {
+-      for (let i = 1; i < chunks.length; i += 1) {
+-        const sent = await sock.sendMessage(chatId, { text: chunks[i] });
+-        trackSentMessageId(sent);
+-        if (sent?.key?.id) messageIds.push(sent.key.id);
+-        if (i < chunks.length - 1) {
+-          await sleep(CHUNK_DELAY_MS);
+-        }
+-      }
+-    }
+-
+-    res.json({ success: true, messageIds });
++    await sock.sendMessage(chatId, { text: formatOutgoingMessage(message), edit: key });
++    res.json({ success: true });
+   } catch (err) {
+     res.status(500).json({ error: err.message });
+   }
+@@ -581,31 +507,8 @@ app.post('/send-media', async (req, res) => {
+         msgPayload = { video: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'video/mp4' };
+         break;
+       case 'audio': {
+-        // WhatsApp only renders a native voice bubble (ptt) when the file is ogg/opus.
+-        // If the caller passes mp3, wav, m4a etc. (e.g. from Edge TTS / NeuTTS),
+-        // silently convert to ogg/opus via ffmpeg so ptt is always honoured.
+-        let audioBuffer = buffer;
+-        let audioExt = ext;
+-        const needsConversion = !['ogg', 'opus'].includes(ext);
+-        let tmpPath = null;
+-        if (needsConversion) {
+-          tmpPath = path.join(tmpdir(), `hermes_voice_${randomBytes(6).toString('hex')}.ogg`);
+-          try {
+-            execSync(
+-              `ffmpeg -y -i ${JSON.stringify(filePath)} -ar 48000 -ac 1 -c:a libopus ${JSON.stringify(tmpPath)}`,
+-              { timeout: 30000, stdio: 'pipe' }
+-            );
+-            audioBuffer = readFileSync(tmpPath);
+-            audioExt = 'ogg';
+-          } catch (convErr) {
+-            // ffmpeg not available or conversion failed — fall back to original format
+-            console.warn('[bridge] ffmpeg conversion failed, sending as file attachment:', convErr.message);
+-          } finally {
+-            try { if (tmpPath && existsSync(tmpPath)) unlinkSync(tmpPath); } catch (_) {}
+-          }
+-        }
+-        const audioMime = (audioExt === 'ogg' || audioExt === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
+-        msgPayload = { audio: audioBuffer, mimetype: audioMime, ptt: audioExt === 'ogg' || audioExt === 'opus' };
++        const audioMime = (ext === 'ogg' || ext === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
++        msgPayload = { audio: buffer, mimetype: audioMime, ptt: ext === 'ogg' || ext === 'opus' };
+         break;
+       }
+       case 'document':
+@@ -621,7 +524,13 @@ app.post('/send-media', async (req, res) => {
+ 
+     const sent = await sock.sendMessage(chatId, msgPayload);
+ 
+-    trackSentMessageId(sent);
++    // Track sent message ID to prevent echo-back loops
++    if (sent?.key?.id) {
++      recentlySentIds.add(sent.key.id);
++      if (recentlySentIds.size > MAX_RECENT_IDS) {
++        recentlySentIds.delete(recentlySentIds.values().next().value);
++      }
++    }
+ 
+     res.json({ success: true, messageId: sent?.key?.id });
+   } catch (err) {
+@@ -693,12 +602,8 @@ if (PAIR_ONLY) {
+     console.log(`📁 Session stored in: ${SESSION_DIR}`);
+     if (ALLOWED_USERS.size > 0) {
+       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+-    } else if (WHATSAPP_MODE === 'self-chat') {
+-      console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
+     } else {
+-      console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
+-      console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
+-      console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
++      console.log(`⚠️  No WHATSAPP_ALLOWED_USERS set — all messages will be processed`);
+     }
+     console.log();
+     startSocket();
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index cdac34d3..0231cfaf 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -3,7 +3,6 @@
+ import json
+ import logging
+ import os
+-import time
+ from pathlib import Path
+ from types import SimpleNamespace
+ from unittest.mock import patch, MagicMock, AsyncMock
+@@ -18,15 +17,14 @@ from agent.auxiliary_client import (
+     auxiliary_max_tokens_param,
+     call_llm,
+     async_call_llm,
+-    _build_call_kwargs,
+     _read_codex_access_token,
+     _get_provider_chain,
+     _is_payment_error,
+-    _is_rate_limit_error,
+     _normalize_aux_provider,
+     _try_payment_fallback,
+     _resolve_auto,
+-    _CodexCompletionsAdapter,
++    _get_task_fallback_specs,
++    _is_capacity_or_rate_error,
+ )
+ 
+ 
+@@ -37,6 +35,7 @@ def _clean_env(monkeypatch):
+         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
+         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
+         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
++        "GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_BASE_URL",
+     ):
+         monkeypatch.delenv(key, raising=False)
+ 
+@@ -60,18 +59,6 @@ def codex_auth_dir(tmp_path, monkeypatch):
+     return codex_dir
+ 
+ 
+-class TestAuxiliaryMaxTokensParam:
+-    def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
+-        with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \
+-             patch("agent.auxiliary_client._read_nous_auth", return_value=None):
+-            assert auxiliary_max_tokens_param(2048) == {"max_completion_tokens": 2048}
+-
+-    def test_uses_max_completion_tokens_for_github_copilot_custom_base_path(self):
+-        with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com/chat/completions", "key", None)), \
+-             patch("agent.auxiliary_client._read_nous_auth", return_value=None):
+-            assert auxiliary_max_tokens_param(2048) == {"max_completion_tokens": 2048}
+-
+-
+ class TestNormalizeAuxProvider:
+     def test_maps_github_copilot_aliases(self):
+         assert _normalize_aux_provider("github") == "copilot"
+@@ -301,52 +288,6 @@ class TestBuildCodexClient:
+         assert client is None
+         assert model is None
+ 
+-    def test_cached_codex_client_rebuilds_when_pool_entry_changes(self):
+-        import agent.auxiliary_client as aux
+-
+-        class _Entry:
+-            def __init__(self, entry_id, token):
+-                self.id = entry_id
+-                self.runtime_api_key = token
+-                self.runtime_base_url = "https://chatgpt.com/backend-api/codex"
+-
+-        class _Pool:
+-            def __init__(self):
+-                self.entry = _Entry("cred-a", "tok-a")
+-
+-            def has_credentials(self):
+-                return True
+-
+-            def current(self):
+-                return self.entry
+-
+-            def peek(self):
+-                return self.entry
+-
+-            def select(self):
+-                return self.entry
+-
+-        pool = _Pool()
+-        client_a = MagicMock(name="codex-client-a")
+-        client_b = MagicMock(name="codex-client-b")
+-
+-        with (
+-            patch("agent.auxiliary_client.load_pool", return_value=pool),
+-            patch("agent.auxiliary_client.OpenAI", side_effect=[client_a, client_b]) as mock_openai,
+-        ):
+-            aux.shutdown_cached_clients()
+-            try:
+-                first_client, first_model = aux._get_cached_client("openai-codex", "gpt-5.4")
+-                pool.entry = _Entry("cred-b", "tok-b")
+-                second_client, second_model = aux._get_cached_client("openai-codex", "gpt-5.4")
+-            finally:
+-                aux.shutdown_cached_clients()
+-
+-        assert first_client is not second_client
+-        assert first_model == "gpt-5.4"
+-        assert second_model == "gpt-5.4"
+-        assert mock_openai.call_count == 2
+-
+ 
+ class TestExpiredCodexFallback:
+     """Test that expired Codex tokens don't block the auto chain."""
+@@ -851,65 +792,6 @@ class TestIsPaymentError:
+         assert _is_payment_error(exc) is False
+ 
+ 
+-class TestIsRateLimitError:
+-    """_is_rate_limit_error detects 429 rate-limit errors warranting fallback."""
+-
+-    def test_429_with_rate_limit_message(self):
+-        exc = Exception("Rate limit exceeded, try again in 2 seconds")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is True
+-
+-    def test_429_with_resets_in_message(self):
+-        """Nous-style 429: 'resets in 3508s'."""
+-        exc = Exception("Hold up for a bit, you've exceeded the rate limit on your API key")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is True
+-
+-    def test_429_with_too_many_requests(self):
+-        exc = Exception("Too many requests")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is True
+-
+-    def test_429_without_billing_keywords_is_rate_limit(self):
+-        """Generic 429 without billing keywords = likely a rate limit."""
+-        exc = Exception("Something went wrong")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is True
+-
+-    def test_429_with_credits_message_is_not_rate_limit(self):
+-        """Billing-related 429 should NOT be classified as rate limit."""
+-        exc = Exception("insufficient credits remaining")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is False
+-
+-    def test_429_with_billing_message_is_not_rate_limit(self):
+-        exc = Exception("you can only afford 1000 tokens")
+-        exc.status_code = 429
+-        assert _is_rate_limit_error(exc) is False
+-
+-    def test_402_is_not_rate_limit(self):
+-        exc = Exception("Payment Required")
+-        exc.status_code = 402
+-        assert _is_rate_limit_error(exc) is False
+-
+-    def test_500_is_not_rate_limit(self):
+-        exc = Exception("Internal Server Error")
+-        exc.status_code = 500
+-        assert _is_rate_limit_error(exc) is False
+-
+-    def test_openai_ratelimiterror_classname(self):
+-        """OpenAI SDK RateLimitError may omit .status_code — detect by class name."""
+-        class RateLimitError(Exception):
+-            pass
+-        exc = RateLimitError("rate limit exceeded")
+-        # No status_code set, but class name matches
+-        assert _is_rate_limit_error(exc) is True
+-
+-    def test_no_status_code_no_keywords_is_not_rate_limit(self):
+-        exc = Exception("connection reset")
+-        assert _is_rate_limit_error(exc) is False
+-
+-
+ class TestGetProviderChain:
+     """_get_provider_chain() resolves functions at call time (testable)."""
+ 
+@@ -981,18 +863,13 @@ class TestTryPaymentFallback:
+ 
+ 
+ class TestCallLlmPaymentFallback:
+-    """call_llm() retries with a different provider on 402 / payment / rate-limit errors."""
++    """call_llm() retries with a different provider on 402 / payment errors."""
+ 
+     def _make_402_error(self, msg="Payment Required: insufficient credits"):
+         exc = Exception(msg)
+         exc.status_code = 402
+         return exc
+ 
+-    def _make_429_rate_limit_error(self, msg="Rate limit exceeded, try again in 60 seconds"):
+-        exc = Exception(msg)
+-        exc.status_code = 429
+-        return exc
+-
+     def test_non_payment_error_not_caught(self, monkeypatch):
+         """Non-payment/non-connection errors (500) should NOT trigger fallback."""
+         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+@@ -1012,31 +889,84 @@ class TestCallLlmPaymentFallback:
+                     messages=[{"role": "user", "content": "hello"}],
+                 )
+ 
+-    def test_429_rate_limit_triggers_fallback(self, monkeypatch):
+-        """429 rate-limit errors should trigger fallback to next provider."""
+-        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
++class TestAuxiliaryConfiguredFallbacks:
++    """Configured auxiliary.<task>.fallbacks are used for retryable errors."""
++
++    def test_get_task_fallback_specs_normalizes_strings_and_dicts(self, monkeypatch):
++        monkeypatch.setattr(
++            "agent.auxiliary_client._get_auxiliary_task_config",
++            lambda task: {
++                "fallbacks": [
++                    "gemini",
++                    {"provider": "anthropic", "model": "claude-opus-4-7"},
++                    {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
++                    "",
++                    {},
++                ],
++            },
++        )
+ 
++        assert _get_task_fallback_specs("vision") == [
++            {"provider": "gemini"},
++            {"provider": "anthropic", "model": "claude-opus-4-7"},
++            {"base_url": "http://127.0.0.1:11434/v1", "model": "local"},
++        ]
++
++    @pytest.mark.parametrize("message,status", [
++        ("capacity exhausted", None),
++        ("quota exceeded", None),
++        ("rate limit", 500),
++        ("Too Many Requests", 429),
++    ])
++    def test_capacity_or_rate_errors_are_retryable(self, message, status):
++        err = Exception(message)
++        if status is not None:
++            err.status_code = status
++        assert _is_capacity_or_rate_error(err) is True
++
++    def test_explicit_vision_provider_uses_configured_fallback_on_429(self, monkeypatch):
+         primary_client = MagicMock()
+-        rate_err = self._make_429_rate_limit_error()
++        rate_err = Exception("capacity exhausted")
++        rate_err.status_code = 429
+         primary_client.chat.completions.create.side_effect = rate_err
+ 
+         fallback_client = MagicMock()
+-        fallback_client.chat.completions.create.return_value = MagicMock(choices=[
+-            MagicMock(message=MagicMock(content="fallback response"))
+-        ])
++        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
++        fallback_client.chat.completions.create.return_value = response
++
++        def fake_resolve_vision_provider_client(provider=None, model=None, **kwargs):
++            if provider == "google-gemini-cli":
++                return "google-gemini-cli", primary_client, "gemini-3-flash-preview"
++            if provider == "gemini":
++                return "gemini", fallback_client, "gemini-3-flash-preview"
++            return provider, None, None
++
++        monkeypatch.setattr(
++            "agent.auxiliary_client._resolve_task_provider_model",
++            lambda *args, **kwargs: (
++                "google-gemini-cli", "gemini-3-flash-preview", None, None, None
++            ),
++        )
++        monkeypatch.setattr(
++            "agent.auxiliary_client._get_auxiliary_task_config",
++            lambda task: {"fallbacks": [{"provider": "gemini", "model": "gemini-3-flash-preview"}]},
++        )
++        monkeypatch.setattr(
++            "agent.auxiliary_client.resolve_vision_provider_client",
++            fake_resolve_vision_provider_client,
++        )
++
++        result = call_llm(
++            task="vision",
++            messages=[{"role": "user", "content": "describe image"}],
++            max_tokens=32,
++        )
++
++        assert result is response
++        assert primary_client.chat.completions.create.call_count == 1
++        assert fallback_client.chat.completions.create.call_count == 1
++        assert fallback_client.chat.completions.create.call_args.kwargs["model"] == "gemini-3-flash-preview"
+ 
+-        with patch("agent.auxiliary_client._get_cached_client",
+-                    return_value=(primary_client, "xiaomi/mimo-v2-pro")), \
+-             patch("agent.auxiliary_client._resolve_task_provider_model",
+-                    return_value=("auto", "xiaomi/mimo-v2-pro", None, None, None)), \
+-             patch("agent.auxiliary_client._try_payment_fallback",
+-                    return_value=(fallback_client, "fallback-model", "openrouter")):
+-            result = call_llm(
+-                task="session_search",
+-                messages=[{"role": "user", "content": "hello"}],
+-            )
+-        # Fallback client should have been used
+-        assert fallback_client.chat.completions.create.called
+ 
+ # ---------------------------------------------------------------------------
+ # Gate: _resolve_api_key_provider must skip anthropic when not configured
+@@ -1230,7 +1160,6 @@ class TestKimiTemperatureOmitted:
+         "model",
+         [
+             "anthropic/claude-sonnet-4-6",
+-            "gpt-5.4",
+             "deepseek-chat",
+         ],
+     )
+@@ -1246,6 +1175,20 @@ class TestKimiTemperatureOmitted:
+ 
+         assert kwargs["temperature"] == 0.3
+ 
++
++    @pytest.mark.parametrize("model", ["gpt-5.4", "gpt-5", "o3-mini", "o4-mini"])
++    def test_openai_reasoning_models_omit_temperature(self, model):
++        from agent.auxiliary_client import _build_call_kwargs
++
++        kwargs = _build_call_kwargs(
++            provider="openrouter",
++            model=model,
++            messages=[{"role": "user", "content": "hello"}],
++            temperature=0.3,
++        )
++
++        assert "temperature" not in kwargs
++
+     @pytest.mark.parametrize(
+         "base_url",
+         [
+@@ -1678,107 +1621,6 @@ class TestAuxiliaryAuthRefreshRetry:
+         assert fresh_client.chat.completions.create.await_count == 1
+ 
+ 
+-class TestAuxiliaryPoolRotationRetry:
+-    def test_call_llm_rotates_explicit_codex_pool_on_429(self):
+-        rate_err = Exception("usage limit reached")
+-        rate_err.status_code = 429
+-
+-        stale_client = MagicMock()
+-        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+-        stale_client.chat.completions.create.side_effect = [rate_err, rate_err]
+-
+-        fresh_client = MagicMock()
+-        fresh_client.base_url = "https://chatgpt.com/backend-api/codex"
+-        fresh_client.chat.completions.create.return_value = _DummyResponse("rotated-sync")
+-
+-        class _Pool:
+-            def __init__(self):
+-                self.rotate_calls = []
+-
+-            def has_credentials(self):
+-                return True
+-
+-            def try_refresh_current(self):
+-                return None
+-
+-            def mark_exhausted_and_rotate(self, **kwargs):
+-                self.rotate_calls.append(kwargs)
+-                return SimpleNamespace(id="cred-b")
+-
+-        pool = _Pool()
+-
+-        with (
+-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+-            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
+-            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
+-            patch("agent.auxiliary_client.load_pool", return_value=pool),
+-            patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback,
+-        ):
+-            resp = call_llm(
+-                task="compression",
+-                provider="openai-codex",
+-                model="gpt-5.4",
+-                messages=[{"role": "user", "content": "hi"}],
+-            )
+-
+-        assert resp.choices[0].message.content == "rotated-sync"
+-        assert stale_client.chat.completions.create.call_count == 2
+-        assert fresh_client.chat.completions.create.call_count == 1
+-        assert len(pool.rotate_calls) == 1
+-        assert pool.rotate_calls[0]["status_code"] == 429
+-        mock_fallback.assert_not_called()
+-
+-    @pytest.mark.asyncio
+-    async def test_async_call_llm_rotates_explicit_codex_pool_on_429(self):
+-        rate_err = Exception("usage limit reached")
+-        rate_err.status_code = 429
+-
+-        stale_client = MagicMock()
+-        stale_client.base_url = "https://chatgpt.com/backend-api/codex"
+-        stale_client.chat.completions.create = AsyncMock(side_effect=[rate_err, rate_err])
+-
+-        fresh_client = MagicMock()
+-        fresh_client.base_url = "https://chatgpt.com/backend-api/codex"
+-        fresh_client.chat.completions.create = AsyncMock(return_value=_DummyResponse("rotated-async"))
+-
+-        class _Pool:
+-            def __init__(self):
+-                self.rotate_calls = []
+-
+-            def has_credentials(self):
+-                return True
+-
+-            def try_refresh_current(self):
+-                return None
+-
+-            def mark_exhausted_and_rotate(self, **kwargs):
+-                self.rotate_calls.append(kwargs)
+-                return SimpleNamespace(id="cred-b")
+-
+-        pool = _Pool()
+-
+-        with (
+-            patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openai-codex", "gpt-5.4", None, None, None)),
+-            patch("agent.auxiliary_client._get_cached_client", side_effect=[(stale_client, "gpt-5.4"), (fresh_client, "gpt-5.4")]),
+-            patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False),
+-            patch("agent.auxiliary_client.load_pool", return_value=pool),
+-            patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback,
+-        ):
+-            resp = await async_call_llm(
+-                task="compression",
+-                provider="openai-codex",
+-                model="gpt-5.4",
+-                messages=[{"role": "user", "content": "hi"}],
+-            )
+-
+-        assert resp.choices[0].message.content == "rotated-async"
+-        assert stale_client.chat.completions.create.await_count == 2
+-        assert fresh_client.chat.completions.create.await_count == 1
+-        assert len(pool.rotate_calls) == 1
+-        assert pool.rotate_calls[0]["status_code"] == 429
+-        mock_fallback.assert_not_called()
+-
+-
+ class TestCodexAdapterReasoningTranslation:
+     """Verify _CodexCompletionsAdapter translates extra_body.reasoning
+     into the Responses API's top-level reasoning + include fields, matching
+@@ -1903,42 +1745,6 @@ class TestCodexAdapterReasoningTranslation:
+         )
+         assert "reasoning" not in captured
+ 
+-    def test_reasoning_effort_null_falls_back_to_medium(self):
+-        """Parity with agent/transports/codex.py::build_kwargs() — falsy
+-        ``effort`` (None / empty / 0) keeps the default ``medium`` instead
+-        of being forwarded to Codex.  Codex rejects ``{"effort": null}``
+-        with HTTP 400 (Invalid value for parameter `reasoning.effort`)."""
+-        adapter, captured = self._build_adapter()
+-        adapter.create(
+-            messages=[{"role": "user", "content": "hi"}],
+-            extra_body={"reasoning": {"effort": None}},
+-        )
+-        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+-        assert captured.get("include") == ["reasoning.encrypted_content"]
+-
+-    def test_reasoning_effort_empty_string_falls_back_to_medium(self):
+-        """Empty-string effort (e.g. ``effort: ""`` in YAML) is falsy in
+-        the main-agent path's truthy check; mirror that here so the same
+-        config produces the same result."""
+-        adapter, captured = self._build_adapter()
+-        adapter.create(
+-            messages=[{"role": "user", "content": "hi"}],
+-            extra_body={"reasoning": {"effort": ""}},
+-        )
+-        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+-        assert captured.get("include") == ["reasoning.encrypted_content"]
+-
+-    def test_reasoning_effort_zero_falls_back_to_medium(self):
+-        """Numeric ``0`` is also falsy — the docstring lists it explicitly,
+-        so cover the contract.  Codex would reject ``{"effort": 0}`` the
+-        same way it rejects ``null``."""
+-        adapter, captured = self._build_adapter()
+-        adapter.create(
+-            messages=[{"role": "user", "content": "hi"}],
+-            extra_body={"reasoning": {"effort": 0}},
+-        )
+-        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+-        assert captured.get("include") == ["reasoning.encrypted_content"]
+ 
+ 
+ class TestVisionAutoSkipsKimiCoding:
+@@ -2042,655 +1848,3 @@ class TestVisionAutoSkipsKimiCoding:
+             "kimi-coding",
+             "kimi-coding-cn",
+         })
+-
+-
+-class TestCodexAuxiliaryAdapterTimeout:
+-    def test_forwards_timeout_to_responses_stream(self):
+-        class FakeStream:
+-            def __enter__(self):
+-                return self
+-
+-            def __exit__(self, exc_type, exc, tb):
+-                return False
+-
+-            def __iter__(self):
+-                return iter(())
+-
+-            def get_final_response(self):
+-                return SimpleNamespace(
+-                    output=[SimpleNamespace(
+-                        type="message",
+-                        content=[SimpleNamespace(type="output_text", text="summary")],
+-                    )],
+-                    usage=None,
+-                )
+-
+-        class FakeResponses:
+-            def __init__(self):
+-                self.kwargs = None
+-
+-            def stream(self, **kwargs):
+-                self.kwargs = kwargs
+-                return FakeStream()
+-
+-        fake_client = SimpleNamespace(responses=FakeResponses())
+-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+-
+-        response = adapter.create(
+-            messages=[{"role": "user", "content": "summarize this"}],
+-            timeout=12.5,
+-        )
+-
+-        assert fake_client.responses.kwargs["timeout"] == 12.5
+-        assert response.choices[0].message.content == "summary"
+-
+-    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+-        class SlowAliveStream:
+-            def __enter__(self):
+-                return self
+-
+-            def __exit__(self, exc_type, exc, tb):
+-                return False
+-
+-            def __iter__(self):
+-                for _ in range(5):
+-                    time.sleep(0.03)
+-                    yield SimpleNamespace(type="response.in_progress")
+-
+-            def get_final_response(self):
+-                return SimpleNamespace(
+-                    output=[SimpleNamespace(
+-                        type="message",
+-                        content=[SimpleNamespace(type="output_text", text="late")],
+-                    )],
+-                    usage=None,
+-                )
+-
+-        class FakeResponses:
+-            def stream(self, **kwargs):
+-                return SlowAliveStream()
+-
+-        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+-        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+-
+-        started = time.monotonic()
+-        with pytest.raises(TimeoutError):
+-            adapter.create(
+-                messages=[{"role": "user", "content": "summarize this"}],
+-                timeout=0.05,
+-            )
+-
+-        assert time.monotonic() - started < 0.14
+-
+-
+-# ---------------------------------------------------------------------------
+-# Issue #23432 — auxiliary timeout poisons cached client; later aux calls fail
+-# ---------------------------------------------------------------------------
+-
+-class TestAuxiliaryClientPoisonedCacheEviction:
+-    """Connection/timeout errors must evict the cached aux client.
+-
+-    Otherwise the next auxiliary call (compression retry, memory flush,
+-    background review) reuses the closed httpx transport and fails with
+-    ``Connection error`` even though the main provider route is healthy.
+-    See https://github.com/NousResearch/hermes-agent/issues/23432.
+-    """
+-
+-    def test_evict_cached_client_instance_drops_direct_match(self):
+-        from agent.auxiliary_client import (
+-            _client_cache, _client_cache_lock, _evict_cached_client_instance,
+-        )
+-
+-        target = MagicMock(name="target_client")
+-        other = MagicMock(name="other_client")
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[("openrouter", False, None, None, None)] = (target, "x", None)
+-            _client_cache[("anthropic", False, None, None, None)] = (other, "y", None)
+-        try:
+-            assert _evict_cached_client_instance(target) is True
+-            assert ("openrouter", False, None, None, None) not in _client_cache
+-            assert ("anthropic", False, None, None, None) in _client_cache
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-    def test_evict_cached_client_instance_walks_codex_wrapper(self):
+-        """Closing the underlying OpenAI client must evict the Codex shim."""
+-        from agent.auxiliary_client import (
+-            _client_cache, _client_cache_lock, _evict_cached_client_instance,
+-            CodexAuxiliaryClient,
+-        )
+-
+-        real = SimpleNamespace(api_key="k", base_url="https://chatgpt.com/backend-api/codex",
+-                               responses=SimpleNamespace(stream=lambda **k: None),
+-                               close=lambda: None)
+-        wrapper = CodexAuxiliaryClient(real, "gpt-5.5")
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[("openai-codex", False, None, None, None)] = (wrapper, "gpt-5.5", None)
+-        try:
+-            # Eviction by the inner OpenAI client must remove the wrapper entry.
+-            assert _evict_cached_client_instance(real) is True
+-            assert ("openai-codex", False, None, None, None) not in _client_cache
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-    def test_evict_cached_client_instance_handles_none_and_misses(self):
+-        from agent.auxiliary_client import _evict_cached_client_instance
+-
+-        assert _evict_cached_client_instance(None) is False
+-        assert _evict_cached_client_instance(MagicMock()) is False
+-
+-    def test_evict_cached_client_instance_walks_async_wrapper(self):
+-        """async_mode is part of the cache key so sync and async share the same
+-        underlying OpenAI client across two distinct cache entries. A single
+-        timeout that closes the leaf must evict BOTH — otherwise the async
+-        entry survives, keeps reusing the dead transport, and every async
+-        aux call (compression, vision, session_search) fails fast with
+-        'Connection error' until gateway restart even while the sync route
+-        recovers.
+-
+-        Regression for the async-side gap left by #23482, which fixed the
+-        sync wrapper's _real_client walk but missed the async wrappers.
+-        """
+-        from agent.auxiliary_client import (
+-            _client_cache, _client_cache_lock, _evict_cached_client_instance,
+-            CodexAuxiliaryClient, AsyncCodexAuxiliaryClient,
+-        )
+-
+-        real = SimpleNamespace(api_key="k", base_url="https://chatgpt.com/backend-api/codex",
+-                               responses=SimpleNamespace(stream=lambda **k: None),
+-                               close=lambda: None)
+-        sync_wrapper = CodexAuxiliaryClient(real, "gpt-5.5")
+-        async_wrapper = AsyncCodexAuxiliaryClient(sync_wrapper)
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[("openai-codex", False, None, None, None)] = (sync_wrapper, "gpt-5.5", None)
+-            _client_cache[("openai-codex", True, None, None, None)] = (async_wrapper, "gpt-5.5", None)
+-        try:
+-            assert _evict_cached_client_instance(real) is True
+-            assert ("openai-codex", False, None, None, None) not in _client_cache
+-            assert ("openai-codex", True, None, None, None) not in _client_cache, (
+-                "async cache entry survived eviction — wrapper is missing _real_client"
+-            )
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-    def test_codex_timeout_evicts_cached_wrapper(self):
+-        """The timeout closer evicts the cache entry that wraps the closed client."""
+-        from agent.auxiliary_client import (
+-            _client_cache, _client_cache_lock,
+-            _CodexCompletionsAdapter, CodexAuxiliaryClient,
+-        )
+-
+-        class SlowAliveStream:
+-            def __enter__(self):
+-                return self
+-
+-            def __exit__(self, exc_type, exc, tb):
+-                return False
+-
+-            def __iter__(self):
+-                for _ in range(20):
+-                    time.sleep(0.01)
+-                    yield SimpleNamespace(type="response.in_progress")
+-
+-            def get_final_response(self):  # pragma: no cover — timeout fires first
+-                return SimpleNamespace(output=[], usage=None)
+-
+-        closed = {"flag": False}
+-
+-        class FakeClient:
+-            def __init__(self):
+-                self.responses = SimpleNamespace(stream=lambda **k: SlowAliveStream())
+-                self.api_key = "k"
+-                self.base_url = "https://chatgpt.com/backend-api/codex"
+-
+-            def close(self):
+-                closed["flag"] = True
+-
+-        fake_real = FakeClient()
+-        wrapper = CodexAuxiliaryClient(fake_real, "gpt-5.5")
+-        cache_key = ("openai-codex", False, None, None, None)
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[cache_key] = (wrapper, "gpt-5.5", None)
+-        try:
+-            adapter = _CodexCompletionsAdapter(fake_real, "gpt-5.5")
+-            with pytest.raises(TimeoutError):
+-                adapter.create(
+-                    messages=[{"role": "user", "content": "x"}],
+-                    timeout=0.05,
+-                )
+-            assert closed["flag"] is True, "timeout closer must close inner client"
+-            assert cache_key not in _client_cache, (
+-                "timeout closer must evict cache entry that wraps the closed client"
+-            )
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-    def test_call_llm_evicts_on_connection_error_with_explicit_provider(self):
+-        """Connection error on an explicit provider must drop the cached client.
+-
+-        This is the exact reporter scenario: ``auxiliary.compression.provider:
+-        main`` (resolves to ``openai-codex``) → no fallback chain runs (not
+-        auto), but the cached client was poisoned by a prior timeout and must
+-        be evicted so the next call rebuilds.
+-        """
+-        from agent.auxiliary_client import _client_cache, _client_cache_lock
+-
+-        poisoned = MagicMock(name="poisoned_client")
+-        poisoned.base_url = "https://chatgpt.com/backend-api/codex"
+-        poisoned.chat.completions.create.side_effect = ConnectionError("transport closed")
+-
+-        cache_key = ("openai-codex", False, None, None, None)
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[cache_key] = (poisoned, "gpt-5.5", None)
+-
+-        try:
+-            with patch(
+-                "agent.auxiliary_client._resolve_task_provider_model",
+-                return_value=("openai-codex", "gpt-5.5", None, None, None),
+-            ), patch(
+-                "agent.auxiliary_client._get_cached_client",
+-                return_value=(poisoned, "gpt-5.5"),
+-            ):
+-                with pytest.raises(ConnectionError):
+-                    call_llm(
+-                        task="compression",
+-                        messages=[{"role": "user", "content": "x"}],
+-                    )
+-            assert cache_key not in _client_cache, (
+-                "connection error must evict cached client so the next call rebuilds"
+-            )
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-    @pytest.mark.asyncio
+-    async def test_async_call_llm_evicts_on_connection_error_with_explicit_provider(self):
+-        from agent.auxiliary_client import _client_cache, _client_cache_lock
+-
+-        poisoned = MagicMock(name="poisoned_async_client")
+-        poisoned.base_url = "https://chatgpt.com/backend-api/codex"
+-        poisoned.chat.completions.create = AsyncMock(side_effect=ConnectionError("transport closed"))
+-
+-        cache_key = ("openai-codex", True, None, None, None)
+-        with _client_cache_lock:
+-            _client_cache.clear()
+-            _client_cache[cache_key] = (poisoned, "gpt-5.5", None)
+-
+-        try:
+-            with patch(
+-                "agent.auxiliary_client._resolve_task_provider_model",
+-                return_value=("openai-codex", "gpt-5.5", None, None, None),
+-            ), patch(
+-                "agent.auxiliary_client._get_cached_client",
+-                return_value=(poisoned, "gpt-5.5"),
+-            ):
+-                with pytest.raises(ConnectionError):
+-                    await async_call_llm(
+-                        task="compression",
+-                        messages=[{"role": "user", "content": "x"}],
+-                    )
+-            assert cache_key not in _client_cache
+-        finally:
+-            with _client_cache_lock:
+-                _client_cache.clear()
+-
+-
+-# ---------------------------------------------------------------------------
+-# _build_call_kwargs — tool dedup at API boundary
+-# ---------------------------------------------------------------------------
+-
+-class TestBuildCallKwargsToolDedup:
+-    """_build_call_kwargs must deduplicate tool names before passing to API.
+-
+-    Providers like Google Vertex, Azure, and Bedrock reject requests with
+-    duplicate tool names (HTTP 400).  This guard converts a hard failure into
+-    a warning log so agent turns succeed even if an upstream injection path
+-    regresses.  See: https://github.com/NousResearch/hermes-agent/issues/18478
+-    """
+-
+-    def _make_tool(self, name: str) -> dict:
+-        return {
+-            "type": "function",
+-            "function": {
+-                "name": name,
+-                "description": f"Tool {name}",
+-                "parameters": {"type": "object", "properties": {}},
+-            },
+-        }
+-
+-    def test_unique_tools_pass_through_unchanged(self):
+-        tools = [self._make_tool("alpha"), self._make_tool("beta")]
+-        kwargs = _build_call_kwargs(
+-            provider="openai", model="gpt-4o", messages=[], tools=tools,
+-        )
+-        assert len(kwargs["tools"]) == 2
+-        names = [t["function"]["name"] for t in kwargs["tools"]]
+-        assert names == ["alpha", "beta"]
+-
+-    def test_duplicate_tool_names_are_deduplicated(self):
+-        """RED test — must fail until dedup guard is added."""
+-        tools = [
+-            self._make_tool("lcm_grep"),
+-            self._make_tool("lcm_describe"),
+-            self._make_tool("lcm_grep"),  # duplicate
+-            self._make_tool("lcm_expand"),
+-            self._make_tool("lcm_describe"),  # duplicate
+-        ]
+-        kwargs = _build_call_kwargs(
+-            provider="google", model="gemini-2.5-pro", messages=[], tools=tools,
+-        )
+-        result_tools = kwargs["tools"]
+-        names = [t["function"]["name"] for t in result_tools]
+-        # Must be deduplicated — no repeated names
+-        assert len(names) == len(set(names)), (
+-            f"Duplicate tool names found: {names}"
+-        )
+-        assert len(result_tools) == 3  # lcm_grep, lcm_describe, lcm_expand
+-
+-    def test_empty_tools_unchanged(self):
+-        kwargs = _build_call_kwargs(
+-            provider="openai", model="gpt-4o", messages=[], tools=[],
+-        )
+-        assert kwargs.get("tools") == [] or "tools" not in kwargs
+-
+-    def test_none_tools_unchanged(self):
+-        kwargs = _build_call_kwargs(
+-            provider="openai", model="gpt-4o", messages=[], tools=None,
+-        )
+-        assert "tools" not in kwargs
+-
+-
+-@pytest.fixture(autouse=True)
+-def _clean_env(monkeypatch):
+-    """Strip provider env vars so each test starts clean."""
+-    for key in (
+-        "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
+-    ):
+-        monkeypatch.delenv(key, raising=False)
+-
+-
+-class TestOpenRouterExplicitApiKey:
+-    """Test that explicit_api_key is correctly propagated to _try_openrouter()."""
+-
+-    def test_resolve_provider_client_passes_explicit_api_key_to_openrouter(
+-        self, monkeypatch
+-    ):
+-        """
+-        When resolve_provider_client() is called with explicit_api_key for OpenRouter,
+-        the explicit key should be passed to the OpenAI client instead of falling back
+-        to OPENROUTER_API_KEY env var.
+-        """
+-        # Set up env var as fallback (should NOT be used when explicit_api_key is provided)
+-        monkeypatch.setenv("OPENROUTER_API_KEY", "env-fallback-key")
+-
+-        # Mock OpenAI to capture the api_key used
+-        mock_openai = MagicMock()
+-        mock_openai.return_value = MagicMock(name="openrouter-client")
+-
+-        with patch("agent.auxiliary_client.OpenAI", mock_openai):
+-            client, model = resolve_provider_client(
+-                provider="openrouter",
+-                explicit_api_key="explicit-pool-key",
+-            )
+-
+-            # Verify a client was created
+-            assert client is not None
+-            # Verify the explicit key was used, not the env var fallback
+-            mock_openai.assert_called_once()
+-            call_kwargs = mock_openai.call_args[1]
+-            assert call_kwargs["api_key"] == "explicit-pool-key", (
+-                f"Expected explicit_api_key to be passed, got: {call_kwargs['api_key']}"
+-            )
+-            assert call_kwargs["api_key"] != "env-fallback-key", (
+-                "Should NOT fall back to OPENROUTER_API_KEY when explicit_api_key is provided"
+-            )
+-
+-    def test_resolve_provider_client_without_explicit_api_key_falls_back_to_env(
+-        self, monkeypatch
+-    ):
+-        """
+-        When resolve_provider_client() is called WITHOUT explicit_api_key for OpenRouter,
+-        it should fall back to OPENROUTER_API_KEY env var.
+-        """
+-        # Set up env var as fallback (should be used when explicit_api_key is NOT provided)
+-        monkeypatch.setenv("OPENROUTER_API_KEY", "env-fallback-key")
+-
+-        # Mock OpenAI to capture the api_key used
+-        mock_openai = MagicMock()
+-        mock_openai.return_value = MagicMock(name="openrouter-client")
+-
+-        with patch("agent.auxiliary_client.OpenAI", mock_openai):
+-            client, model = resolve_provider_client(
+-                provider="openrouter",
+-                explicit_api_key=None,
+-            )
+-
+-            # Verify a client was created
+-            assert client is not None
+-            # Verify the env var fallback was used
+-            mock_openai.assert_called_once()
+-            call_kwargs = mock_openai.call_args[1]
+-            assert call_kwargs["api_key"] == "env-fallback-key", (
+-                f"Expected env fallback key to be used when explicit_api_key is None, got: {call_kwargs['api_key']}"
+-            )
+-
+-
+-class TestAnthropicExplicitApiKey:
+-    """Test that explicit_api_key is correctly propagated to _try_anthropic().
+-
+-    Parity with the OpenRouter fix in #18768: resolve_provider_client() passes
+-    explicit_api_key to _try_openrouter(), but the anthropic branch was not
+-    updated — _try_anthropic() always fell back to resolve_anthropic_token()
+-    even when an explicit key was supplied (e.g. from a fallback_model entry).
+-    """
+-
+-    def test_try_anthropic_uses_explicit_api_key_over_env(self):
+-        """_try_anthropic(explicit_api_key) must use the supplied key, not the env fallback."""
+-        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-fallback-key"), \
+-             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+-             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+-            mock_build.return_value = MagicMock()
+-            from agent.auxiliary_client import _try_anthropic
+-            client, model = _try_anthropic("explicit-pool-key")
+-        assert client is not None
+-        assert mock_build.call_args.args[0] == "explicit-pool-key", (
+-            f"Expected explicit_api_key to be passed, got: {mock_build.call_args.args[0]}"
+-        )
+-        assert mock_build.call_args.args[0] != "env-fallback-key"
+-
+-    def test_try_anthropic_without_explicit_key_falls_back_to_resolve(self):
+-        """Without explicit_api_key, _try_anthropic falls back to resolve_anthropic_token."""
+-        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-fallback-key"), \
+-             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+-             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+-            mock_build.return_value = MagicMock()
+-            from agent.auxiliary_client import _try_anthropic
+-            client, model = _try_anthropic()
+-        assert client is not None
+-        assert mock_build.call_args.args[0] == "env-fallback-key"
+-
+-    def test_resolve_provider_client_passes_explicit_api_key_to_anthropic(self):
+-        """resolve_provider_client(provider='anthropic', explicit_api_key=...) must propagate the key."""
+-        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="env-key"), \
+-             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+-             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+-            mock_build.return_value = MagicMock()
+-            client, model = resolve_provider_client(
+-                provider="anthropic",
+-                explicit_api_key="explicit-fallback-key",
+-            )
+-        assert client is not None
+-        assert mock_build.call_args.args[0] == "explicit-fallback-key", (
+-            "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
+-        )
+-
+-
+-# ── Auxiliary unhealthy-provider TTL cache (issue #23570) ────────────────
+-
+-
+-class TestAuxUnhealthyCache:
+-    """Recently-402'd providers are skipped on subsequent aux calls.
+-
+-    Without this, every compression / title-gen / session-search call on a
+-    long session retries a depleted OpenRouter (~1 RTT to 402) before
+-    falling back to the next provider. The TTL cache hides the unhealthy
+-    provider for ``_AUX_UNHEALTHY_TTL_SECONDS`` so the chain skips it.
+-    """
+-
+-    def setup_method(self):
+-        from agent.auxiliary_client import _reset_aux_unhealthy_cache
+-        _reset_aux_unhealthy_cache()
+-
+-    def teardown_method(self):
+-        from agent.auxiliary_client import _reset_aux_unhealthy_cache
+-        _reset_aux_unhealthy_cache()
+-
+-    def test_mark_then_skip(self):
+-        from agent.auxiliary_client import (
+-            _mark_provider_unhealthy,
+-            _is_provider_unhealthy,
+-        )
+-        assert _is_provider_unhealthy("openrouter") is False
+-        _mark_provider_unhealthy("openrouter")
+-        assert _is_provider_unhealthy("openrouter") is True
+-
+-    def test_ttl_expiry_evicts(self):
+-        from agent.auxiliary_client import (
+-            _mark_provider_unhealthy,
+-            _is_provider_unhealthy,
+-            _aux_unhealthy_until,
+-        )
+-        _mark_provider_unhealthy("openrouter", ttl=0.01)
+-        assert _is_provider_unhealthy("openrouter") is True
+-        import time
+-        time.sleep(0.02)
+-        # Lazy eviction: first lookup after expiry returns False AND removes the entry.
+-        assert _is_provider_unhealthy("openrouter") is False
+-        assert "openrouter" not in _aux_unhealthy_until
+-
+-    def test_alias_normalization(self):
+-        """'codex' should normalize to 'openai-codex' so the cache lookup
+-        matches the chain label."""
+-        from agent.auxiliary_client import (
+-            _mark_provider_unhealthy,
+-            _is_provider_unhealthy,
+-        )
+-        _mark_provider_unhealthy("codex")
+-        assert _is_provider_unhealthy("openai-codex") is True
+-
+-    def test_resolve_auto_skips_unhealthy_step2(self):
+-        """_resolve_auto Step-2 chain skips unhealthy providers."""
+-        from agent.auxiliary_client import (
+-            _resolve_auto,
+-            _mark_provider_unhealthy,
+-        )
+-        nous_client = MagicMock()
+-        # Mark OpenRouter unhealthy → chain should skip it and pick nous.
+-        _mark_provider_unhealthy("openrouter")
+-        with patch("agent.auxiliary_client._read_main_provider", return_value=""), \
+-             patch("agent.auxiliary_client._read_main_model", return_value=""), \
+-             patch("agent.auxiliary_client._try_openrouter") as or_try, \
+-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "nous-model")), \
+-             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+-            client, model = _resolve_auto()
+-        assert client is nous_client
+-        assert model == "nous-model"
+-        # The skipped provider's _try_* should NOT have been called at all.
+-        or_try.assert_not_called()
+-
+-    def test_resolve_auto_skips_unhealthy_main_in_step1(self):
+-        """Step-1 also consults the unhealthy cache so a depleted main
+-        provider doesn't burn a 402 RTT every aux call. Falls through to
+-        Step-2 chain (which also respects the cache)."""
+-        from agent.auxiliary_client import (
+-            _resolve_auto,
+-            _mark_provider_unhealthy,
+-        )
+-        nous_client = MagicMock()
+-        _mark_provider_unhealthy("openrouter")
+-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+-             patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4.6"), \
+-             patch("agent.auxiliary_client.resolve_provider_client") as step1, \
+-             patch("agent.auxiliary_client._try_openrouter") as or_try, \
+-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
+-             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+-            client, model = _resolve_auto()
+-        # Step-1 was bypassed — resolve_provider_client never invoked
+-        step1.assert_not_called()
+-        # Step-2 also skipped openrouter and landed on nous
+-        or_try.assert_not_called()
+-        assert client is nous_client
+-
+-    def test_payment_fallback_skips_unhealthy(self):
+-        """_try_payment_fallback also consults the unhealthy cache so a 402
+-        on OpenRouter doesn't cause a second OR call within the same chain
+-        iteration if it gets re-entered."""
+-        from agent.auxiliary_client import (
+-            _try_payment_fallback,
+-            _mark_provider_unhealthy,
+-        )
+-        nous_client = MagicMock()
+-        # Mark BOTH the failed provider (openrouter) and a sibling (custom)
+-        # unhealthy. The chain should still find nous.
+-        _mark_provider_unhealthy("local/custom")
+-        with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
+-             patch("agent.auxiliary_client._try_openrouter") as or_try, \
+-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
+-             patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
+-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+-            client, model, label = _try_payment_fallback("openrouter", task="compression")
+-        assert client is nous_client
+-        assert label == "nous"
+-        # OR is skipped via skip_chain_labels (failed provider), custom via unhealthy cache.
+-        or_try.assert_not_called()
+-        custom_try.assert_not_called()
+-
+-    def test_call_llm_marks_provider_unhealthy_on_402(self, monkeypatch):
+-        """A 402 from call_llm causes the provider to be marked unhealthy
+-        so the next call skips it instead of re-trying the same depleted
+-        endpoint."""
+-        from agent.auxiliary_client import (
+-            call_llm,
+-            _is_provider_unhealthy,
+-        )
+-        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+-
+-        primary_client = MagicMock()
+-        # base_url tells _recoverable_pool_provider() that this is OpenRouter
+-        # (resolved_provider="auto" doesn't carry that information by itself).
+-        primary_client.base_url = "https://openrouter.ai/api/v1/"
+-        err = Exception("Payment Required: insufficient credits")
+-        err.status_code = 402
+-        primary_client.chat.completions.create.side_effect = err
+-
+-        nous_client = MagicMock()
+-        nous_resp = MagicMock()
+-        nous_resp.choices = [MagicMock(message=MagicMock(content="ok"))]
+-        nous_client.chat.completions.create.return_value = nous_resp
+-
+-        with patch("agent.auxiliary_client._get_cached_client",
+-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+-             patch("agent.auxiliary_client._resolve_task_provider_model",
+-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+-             patch("agent.auxiliary_client._try_payment_fallback",
+-                    return_value=(nous_client, "n-model", "nous")), \
+-             patch("agent.auxiliary_client._build_call_kwargs",
+-                    return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
+-            assert _is_provider_unhealthy("openrouter") is False
+-            call_llm(
+-                task="compression",
+-                messages=[{"role": "user", "content": "hi"}],
+-            )
+-            # After the 402, OpenRouter is in the unhealthy cache.
+-            assert _is_provider_unhealthy("openrouter") is True
+diff --git a/tests/agent/test_title_generator.py b/tests/agent/test_title_generator.py
+index c498a71a..264a0034 100644
+--- a/tests/agent/test_title_generator.py
++++ b/tests/agent/test_title_generator.py
+@@ -52,13 +52,14 @@ class TestGenerateTitle:
+             assert len(title) == 80
+             assert title.endswith("...")
+ 
+-    def test_returns_none_on_empty_response(self):
++    def test_falls_back_to_prompt_on_empty_response(self):
+         mock_response = MagicMock()
+         mock_response.choices = [MagicMock()]
+         mock_response.choices[0].message.content = ""
++        mock_response.choices[0].finish_reason = "length"
+ 
+         with patch("agent.title_generator.call_llm", return_value=mock_response):
+-            assert generate_title("question", "answer") is None
++            assert generate_title("gateway shut down again, keep going", "answer") == "gateway shut down"
+ 
+     def test_returns_none_on_exception(self):
+         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
+@@ -136,21 +137,6 @@ class TestAutoTitleSession:
+             auto_title_session(db, "sess-1", "hi", "hello")
+             db.set_session_title.assert_called_once_with("sess-1", "New Title")
+ 
+-    def test_invokes_title_callback_after_setting_title(self):
+-        db = MagicMock()
+-        db.get_session_title.return_value = None
+-        seen = []
+-        with patch("agent.title_generator.generate_title", return_value="Readable Session"):
+-            auto_title_session(
+-                db,
+-                "sess-1",
+-                "hello",
+-                "hi there",
+-                title_callback=seen.append,
+-            )
+-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
+-        assert seen == ["Readable Session"]
+-
+     def test_skips_if_generation_fails(self):
+         db = MagicMock()
+         db.get_session_title.return_value = None
+@@ -197,13 +183,7 @@ class TestMaybeAutoTitle:
+             import time
+             time.sleep(0.3)
+             mock_auto.assert_called_once_with(
+-                db,
+-                "sess-1",
+-                "hello",
+-                "hi there",
+-                failure_callback=None,
+-                main_runtime=None,
+-                title_callback=None,
++                db, "sess-1", "hello", "hi there", failure_callback=None, main_runtime=None
+             )
+ 
+     def test_forwards_failure_callback_to_worker(self):
+@@ -223,13 +203,7 @@ class TestMaybeAutoTitle:
+             import time
+             time.sleep(0.3)
+             mock_auto.assert_called_once_with(
+-                db,
+-                "sess-1",
+-                "hello",
+-                "hi there",
+-                failure_callback=_cb,
+-                main_runtime=None,
+-                title_callback=None,
++                db, "sess-1", "hello", "hi there", failure_callback=_cb, main_runtime=None
+             )
+ 
+     def test_skips_if_no_response(self):
+diff --git a/tests/gateway/test_discord_thread_rename.py b/tests/gateway/test_discord_thread_rename.py
+new file mode 100755
+index 00000000..7163c906
+--- /dev/null
++++ b/tests/gateway/test_discord_thread_rename.py
+@@ -0,0 +1,373 @@
++"""Tests for the Discord thread auto-rename feature.
++
++Covers:
++  * Title sanitization (quotes, punctuation, length, whitespace).
++  * Config gating (env vars, enabled/disabled).
++  * "Looks like raw prompt" detection so user-set names are not stomped.
++  * Discord API failure fallback (no exception, returns None).
++  * Repeat-rename prevention via the ``is_renamed`` callback.
++"""
++
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from gateway.platforms.discord_thread_rename import (
++    DEFAULT_MAX_LENGTH,
++    DELAY_AFTER_FIRST_ASSISTANT_RESPONSE,
++    DISCORD_MAX_THREAD_NAME,
++    DiscordAutoRenameConfig,
++    load_config_from_env,
++    looks_like_raw_prompt,
++    maybe_auto_rename_thread,
++    sanitize_title,
++    strip_discord_mentions,
++)
++
++
++# --------------------------------------------------------------------------
++# sanitize_title
++# --------------------------------------------------------------------------
++
++
++class TestSanitizeTitle:
++    def test_strips_quotes_and_punctuation(self):
++        assert sanitize_title('"Auto-renommage des threads Discord."') == \
++            "Auto-renommage des threads Discord"
++
++    def test_strips_title_prefix(self):
++        assert sanitize_title("Title: Refactor login flow") == "Refactor login flow"
++
++    def test_collapses_whitespace_and_newlines(self):
++        assert sanitize_title("Refactor   the\nlogin\tflow") == "Refactor the login flow"
++
++    def test_returns_empty_for_empty_input(self):
++        assert sanitize_title("") == ""
++        assert sanitize_title("   ") == ""
++        assert sanitize_title("...") == ""
++
++    def test_truncates_to_max_length_on_word_boundary(self):
++        title = "This is a long generated title that exceeds the limit by a lot"
++        out = sanitize_title(title, max_length=30)
++        assert len(out) <= 30
++        assert out.endswith("\u2026")
++        assert " " in out  # word boundary cut, not mid-word
++
++    def test_clamps_max_length_to_discord_limit(self):
++        # Even with a huge config cap, never exceed Discord's 100-char limit.
++        long = "x" * 200
++        out = sanitize_title(long, max_length=500)
++        assert len(out) <= DISCORD_MAX_THREAD_NAME
++
++    def test_handles_curly_quotes(self):
++        assert sanitize_title("\u201cFix login bug\u201d") == "Fix login bug"
++
++    def test_returns_short_unchanged(self):
++        assert sanitize_title("Hello world") == "Hello world"
++
++
++# --------------------------------------------------------------------------
++# load_config_from_env
++# --------------------------------------------------------------------------
++
++
++class TestLoadConfig:
++    def test_defaults_enabled(self):
++        cfg = load_config_from_env(env={})
++        assert cfg.enabled is True
++        assert cfg.max_length == DEFAULT_MAX_LENGTH
++        assert cfg.delay == DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    def test_disabled_via_env(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_THREADS": "false"})
++        assert cfg.enabled is False
++
++    def test_max_length_override(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_MAX_LENGTH": "40"})
++        assert cfg.max_length == 40
++
++    def test_invalid_max_length_falls_back(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_MAX_LENGTH": "abc"})
++        assert cfg.max_length == DEFAULT_MAX_LENGTH
++
++    def test_unknown_delay_falls_back_to_default(self):
++        cfg = load_config_from_env(env={"DISCORD_AUTO_RENAME_DELAY": "ater_first_yolo"})
++        assert cfg.delay == DELAY_AFTER_FIRST_ASSISTANT_RESPONSE
++
++    def test_effective_max_length_clamps_to_discord_limit(self):
++        cfg = DiscordAutoRenameConfig(enabled=True, max_length=500)
++        assert cfg.effective_max_length == DISCORD_MAX_THREAD_NAME
++
++    def test_effective_max_length_replaces_zero_with_default(self):
++        cfg = DiscordAutoRenameConfig(enabled=True, max_length=0)
++        assert cfg.effective_max_length == DEFAULT_MAX_LENGTH
++
++
++# --------------------------------------------------------------------------
++# looks_like_raw_prompt
++# --------------------------------------------------------------------------
++
++
++class TestLooksLikeRawPrompt:
++    def test_exact_match(self):
++        assert looks_like_raw_prompt("hello world", "hello world") is True
++
++    def test_truncated_with_ellipsis(self):
++        prompt = "lorsque l'agent Hermes ouvre un thread dans Discord il le renomme"
++        # adapter does prompt[:77] + "..."
++        seeded = prompt[:77] + "..."
++        assert looks_like_raw_prompt(seeded, prompt) is True
++
++    def test_user_set_name_returns_false(self):
++        assert looks_like_raw_prompt("Customer billing thread", "fix the broken login") is False
++
++    def test_empty_inputs(self):
++        assert looks_like_raw_prompt("", "anything") is False
++        assert looks_like_raw_prompt("anything", "") is False
++
++
++# --------------------------------------------------------------------------
++# maybe_auto_rename_thread
++# --------------------------------------------------------------------------
++
++
++def _fake_thread(name: str, edit: AsyncMock | None = None):
++    thread = MagicMock()
++    thread.id = 1234567
++    thread.name = name
++    thread.edit = edit if edit is not None else AsyncMock()
++    return thread
++
++
++@pytest.mark.asyncio
++async def test_renames_thread_on_happy_path():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug please")
++    on_renamed = MagicMock()
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message="fix the login bug please",
++        assistant_response="Sure, looking into it.",
++        config=cfg,
++        on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix the broken login flow",
++    )
++
++    assert result == "Fix the broken login flow"
++    thread.edit.assert_awaited_once()
++    kwargs = thread.edit.await_args.kwargs
++    assert kwargs["name"] == "Fix the broken login flow"
++    assert "reason" in kwargs
++    on_renamed.assert_called_once_with("Fix the broken login flow")
++
++
++@pytest.mark.asyncio
++async def test_skips_when_disabled():
++    cfg = DiscordAutoRenameConfig(enabled=False)
++    thread = _fake_thread("anything")
++
++    result = await maybe_auto_rename_thread(
++        thread, "u", "a", cfg,
++        title_generator=lambda u, a: "Generated",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_already_renamed():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug please")
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug please", "ok", cfg,
++        is_renamed=lambda: True,
++        title_generator=lambda u, a: "Generated Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_thread_name_no_longer_matches_prompt():
++    """User (or another agent) already renamed the thread — leave it alone."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("Customer billing thread")
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message="fix the broken login",
++        assistant_response="ok",
++        config=cfg,
++        title_generator=lambda u, a: "Generated Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_does_not_raise_when_discord_edit_fails():
++    """Forbidden / HTTPException must be swallowed and logged — never bubble."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    edit = AsyncMock(side_effect=RuntimeError("403 Forbidden: missing perms"))
++    thread = _fake_thread("fix the login bug", edit=edit)
++    on_renamed = MagicMock()
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix Login Bug",
++    )
++
++    assert result is None
++    edit.assert_awaited_once()
++    on_renamed.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_title_generator_returns_empty():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        title_generator=lambda u, a: "",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_skips_when_user_or_assistant_message_missing():
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++    result = await maybe_auto_rename_thread(
++        thread, "", "response", cfg,
++        title_generator=lambda u, a: "Title",
++    )
++    assert result is None
++    thread.edit.assert_not_awaited()
++
++
++# --------------------------------------------------------------------------
++# strip_discord_mentions  — must mirror DiscordAdapter._auto_create_thread
++# so the captured prompt matches the seeded thread name.
++# --------------------------------------------------------------------------
++
++
++class TestStripDiscordMentions:
++    def test_strips_user_mention(self):
++        assert strip_discord_mentions("hey <@1234> please help") == "hey please help"
++
++    def test_strips_nick_mention(self):
++        assert strip_discord_mentions("yo <@!9999>") == "yo"
++
++    def test_strips_role_mention(self):
++        assert strip_discord_mentions("ping <@&5550> team") == "ping team"
++
++    def test_strips_channel_mention(self):
++        assert strip_discord_mentions("see <#42> for context") == "see for context"
++
++    def test_strips_mixed_mentions(self):
++        out = strip_discord_mentions("<@1> talk to <@&2> in <#3> about <@!4> thanks")
++        assert out == "talk to in about thanks"
++
++    def test_collapses_whitespace(self):
++        assert strip_discord_mentions("foo\n\n  bar\tbaz") == "foo bar baz"
++
++    def test_empty_input(self):
++        assert strip_discord_mentions("") == ""
++        assert strip_discord_mentions("<@1>") == ""
++
++
++@pytest.mark.asyncio
++async def test_renames_thread_when_prompt_contained_mentions():
++    """Regression: a prompt like '<@&5550> fix the bug' is normalized to
++    'fix the bug' when seeding the thread name; the captured prompt must
++    be normalized the same way so looks_like_raw_prompt matches.
++    """
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    # The thread was auto-created from "fix the bug" (mentions stripped).
++    thread = _fake_thread("fix the bug")
++
++    # The captured prompt has been normalized via strip_discord_mentions
++    # by the adapter before storage; we feed it the cleaned form here.
++    captured = strip_discord_mentions("<@&5550> fix the bug")
++    assert captured == "fix the bug"
++
++    result = await maybe_auto_rename_thread(
++        thread,
++        user_message=captured,
++        assistant_response="On it.",
++        config=cfg,
++        title_generator=lambda u, a: "Fix the broken login",
++    )
++    assert result == "Fix the broken login"
++    thread.edit.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_title_generation_runs_off_event_loop():
++    """generate_title can block on an LLM call — confirm we hand it off
++    to a worker thread via asyncio.to_thread instead of running it
++    inline on the Discord event loop.
++    """
++    import threading
++    cfg = DiscordAutoRenameConfig(enabled=True)
++    thread = _fake_thread("fix the login bug")
++    main_thread_id = threading.get_ident()
++    seen_thread_ids: list[int] = []
++
++    def slow_blocking_generator(_user, _assistant):
++        seen_thread_ids.append(threading.get_ident())
++        return "Fix Login Bug"
++
++    result = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        title_generator=slow_blocking_generator,
++    )
++
++    assert result == "Fix Login Bug"
++    assert seen_thread_ids, "title_generator was not called"
++    # The generator must have run on a worker thread, not the caller's
++    # (event-loop) thread.
++    assert seen_thread_ids[0] != main_thread_id
++
++
++@pytest.mark.asyncio
++async def test_marks_renamed_only_after_successful_edit():
++    """on_renamed must fire exactly once after a successful edit, not before."""
++    cfg = DiscordAutoRenameConfig(enabled=True)
++
++    renamed_state = {"done": False}
++
++    async def fake_edit(name, reason):
++        # Simulate edit succeeding.
++        return None
++
++    thread = _fake_thread("fix the login bug", edit=AsyncMock(side_effect=fake_edit))
++
++    def is_renamed():
++        return renamed_state["done"]
++
++    def on_renamed(_title):
++        renamed_state["done"] = True
++
++    out1 = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        is_renamed=is_renamed, on_renamed=on_renamed,
++        title_generator=lambda u, a: "Fix Login Bug",
++    )
++    assert out1 == "Fix Login Bug"
++    assert renamed_state["done"] is True
++
++    # Second call must short-circuit on is_renamed=True.
++    out2 = await maybe_auto_rename_thread(
++        thread, "fix the login bug", "ok", cfg,
++        is_renamed=is_renamed, on_renamed=on_renamed,
++        title_generator=lambda u, a: "Different Title",
++    )
++    assert out2 is None
++    # edit was called only once across both invocations
++    assert thread.edit.await_count == 1
+diff --git a/tests/plugins/image_gen/test_openai_codex_provider.py b/tests/plugins/image_gen/test_openai_codex_provider.py
+index 3c8cf86c..cd4d22e7 100644
+--- a/tests/plugins/image_gen/test_openai_codex_provider.py
++++ b/tests/plugins/image_gen/test_openai_codex_provider.py
+@@ -199,6 +199,43 @@ class TestGenerate:
+         assert tool["background"] == "opaque"
+         assert tool["partial_images"] == 1
+ 
++    def test_reference_images_are_sent_as_input_images(self, provider, monkeypatch, tmp_path):
++        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
++        ref = tmp_path / "ref.png"
++        ref.write_bytes(bytes.fromhex(_PNG_HEX))
++        captured = {}
++
++        def _stream(**kwargs):
++            captured.update(kwargs)
++            output_item = SimpleNamespace(
++                type="image_generation_call",
++                status="generating",
++                id="ig_test",
++                result=_b64_png(),
++            )
++            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
++            final_response = SimpleNamespace(output=[], status="completed", output_text="")
++            return _FakeStream([done_event], final_response)
++
++        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
++        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
++
++        result = provider.generate("restyle this", references=[str(ref)])
++
++        assert result["success"] is True
++        assert result["references"] == 1
++        content = captured["input"][0]["content"]
++        assert content[0]["type"] == "input_text"
++        assert content[1]["type"] == "input_image"
++        assert content[1]["image_url"].startswith("data:image/png;base64,")
++
++    def test_invalid_reference_path_returns_error(self, provider, monkeypatch, tmp_path):
++        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
++        result = provider.generate("restyle this", references=[str(tmp_path / "missing.png")])
++
++        assert result["success"] is False
++        assert result["error_type"] == "invalid_reference"
++
+     def test_partial_image_event_used_when_done_missing(self, provider, monkeypatch):
+         """If the stream never emits output_item.done, fall back to the
+         partial_image event so users at least get the latest preview frame."""
+diff --git a/tests/tools/test_image_generation_plugin_dispatch.py b/tests/tools/test_image_generation_plugin_dispatch.py
+index fa8ca9d9..15794c28 100644
+--- a/tests/tools/test_image_generation_plugin_dispatch.py
++++ b/tests/tools/test_image_generation_plugin_dispatch.py
+@@ -97,3 +97,88 @@ class TestPluginDispatch:
+         assert payload["success"] is True
+         assert payload["provider"] == "codex"
+         assert payload["aspect_ratio"] == "portrait"
++
++    def test_dispatch_rejects_references_for_unsupported_provider(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++        from hermes_cli import plugins as plugins_module
++        from agent import image_gen_registry as registry_module
++
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
++        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
++        monkeypatch.setattr(registry_module, "get_provider", lambda name: _FakeCodexProvider())
++
++        dispatched = image_generation_tool._dispatch_to_plugin_provider(
++            "draw cat",
++            "square",
++            references=["/tmp/ref.png"],
++        )
++        payload = json.loads(dispatched)
++
++        assert payload["success"] is False
++        assert payload["error_type"] == "references_unsupported"
++
++    def test_dispatch_forwards_references_to_supported_provider(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++        from hermes_cli import plugins as plugins_module
++        from agent import image_gen_registry as registry_module
++
++        class _ReferenceProvider(_FakeCodexProvider):
++            seen = None
++
++            @property
++            def supports_references(self) -> bool:
++                return True
++
++            def generate(self, prompt, aspect_ratio="landscape", **kwargs):
++                self.seen = kwargs.get("references")
++                result = super().generate(prompt, aspect_ratio, **kwargs)
++                result["references"] = self.seen
++                return result
++
++        provider = _ReferenceProvider()
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
++        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda force=False: None)
++        monkeypatch.setattr(registry_module, "get_provider", lambda name: provider)
++
++        dispatched = image_generation_tool._dispatch_to_plugin_provider(
++            "draw cat",
++            "square",
++            references=["/tmp/ref.png"],
++        )
++        payload = json.loads(dispatched)
++
++        assert payload["success"] is True
++        assert payload["references"] == ["/tmp/ref.png"]
++
++    def test_materialize_downloads_reference_url_to_cache_without_preserving_query(self, monkeypatch, tmp_path):
++        from tools import image_generation_tool
++
++        class _Headers(dict):
++            def get(self, key, default=None):
++                return super().get(key, default)
++
++        class _Response:
++            headers = _Headers({"Content-Type": "image/png"})
++
++            def __enter__(self):
++                return self
++
++            def __exit__(self, *args):
++                return False
++
++            def read(self, limit):
++                return b"\x89PNG\r\n\x1a\n"
++
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        monkeypatch.setattr(image_generation_tool, "urlopen", lambda req, timeout=20: _Response())
++
++        refs, error = image_generation_tool._materialize_reference_inputs({
++            "reference_image_url": "https://cdn.discordapp.com/attachments/a/b/ref.png?ex=secret&hm=secret",
++        })
++
++        assert error is None
++        assert len(refs) == 1
++        assert refs[0].startswith(str(tmp_path / "cache" / "image_references"))
++        assert "?" not in refs[0]
+diff --git a/tools/image_generation_tool.py b/tools/image_generation_tool.py
+index c496166e..54c03f0f 100644
+--- a/tools/image_generation_tool.py
++++ b/tools/image_generation_tool.py
+@@ -26,43 +26,12 @@ import os
+ import datetime
+ import threading
+ import uuid
+-from typing import Any, Dict, Optional, Union
+-from urllib.parse import urlencode
+-
+-# fal_client is imported lazily — see _load_fal_client(). Pulling it
+-# eagerly added ~64 ms to every CLI cold start because
+-# discover_builtin_tools() imports this module unconditionally during
+-# the registry walk, even when image generation is never used.
+-#
+-# Tests that monkeypatch this attribute (e.g.
+-# ``monkeypatch.setattr(image_tool, "fal_client", fake_fal_client)``)
+-# still work: _load_fal_client() short-circuits when the attribute is
+-# anything truthy, so a test-installed mock is not overwritten by a
+-# subsequent real import.
+-fal_client: Any = None
+-
+-
+-def _load_fal_client() -> Any:
+-    """Lazily import fal_client and rebind the module global on first use.
+-
+-    Idempotent. Returns the (now-loaded) ``fal_client`` module reference.
+-    Skips the import if the global is already truthy — this preserves the
+-    test pattern of monkeypatching the module global to install a mock.
+-    """
+-    global fal_client
+-    if fal_client is not None:
+-        return fal_client
+-    try:
+-        from tools.lazy_deps import ensure as _lazy_ensure
+-        _lazy_ensure("image.fal", prompt=False)
+-    except ImportError:
+-        pass
+-    except Exception as e:
+-        raise ImportError(str(e))
+-    import fal_client as _fal_client  # noqa: F811 — module-global rebind
+-    fal_client = _fal_client
+-    return fal_client
++from pathlib import Path
++from typing import Any, Dict, List, Optional, Union
++from urllib.parse import urlencode, urlsplit
++from urllib.request import Request, urlopen
+ 
++import fal_client
+ 
+ from tools.debug_helpers import DebugSession
+ from tools.managed_tool_gateway import resolve_managed_tool_gateway
+@@ -371,9 +340,6 @@ class _ManagedFalSyncClient:
+     """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
+ 
+     def __init__(self, *, key: str, queue_run_origin: str):
+-        # Trigger the lazy import on first construction. Idempotent — the
+-        # placeholder is overwritten with the real module on first call.
+-        _load_fal_client()
+         sync_client_class = getattr(fal_client, "SyncClient", None)
+         if sync_client_class is None:
+             raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
+@@ -471,8 +437,6 @@ def _get_managed_fal_client(managed_gateway):
+ 
+ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
+     """Submit a FAL request using direct credentials or the managed queue gateway."""
+-    # Trigger the lazy import on first call. Idempotent.
+-    _load_fal_client()
+     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
+     managed_gateway = _resolve_managed_fal_gateway()
+     if managed_gateway is None:
+@@ -582,7 +546,7 @@ def _build_fal_payload(
+     payload: Dict[str, Any] = dict(meta.get("defaults", {}))
+     payload["prompt"] = (prompt or "").strip()
+ 
+-    if size_style in {"image_size_preset", "gpt_literal"}:
++    if size_style in ("image_size_preset", "gpt_literal"):
+         payload["image_size"] = sizes[aspect]
+     elif size_style == "aspect_ratio":
+         payload["aspect_ratio"] = sizes[aspect]
+@@ -826,11 +790,7 @@ def check_image_generation_requirements() -> bool:
+     """
+     try:
+         if check_fal_api_key():
+-            # Trigger the lazy fal_client import here as the SDK presence
+-            # check. Raises ImportError if the optional ``fal-client``
+-            # package isn't installed; the caller's except ImportError
+-            # below catches that and continues to plugin probing.
+-            _load_fal_client()
++            fal_client  # noqa: F401 — SDK presence check
+             return True
+     except ImportError:
+         pass
+@@ -893,10 +853,97 @@ if __name__ == "__main__":
+ # ---------------------------------------------------------------------------
+ from tools.registry import registry, tool_error
+ 
++_REFERENCE_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
++
++
++def _redact_url_for_error(url: str) -> str:
++    """Return a URL safe for logs/errors by stripping signed query params."""
++    try:
++        parts = urlsplit(url)
++        safe_path = parts.path
++        if len(safe_path) > 80:
++            safe_path = "..." + safe_path[-77:]
++        return f"{parts.scheme}://{parts.netloc}{safe_path}"
++    except Exception:
++        return "[invalid-url]"
++
++
++def _reference_cache_dir() -> Path:
++    from hermes_constants import get_hermes_home
++
++    path = get_hermes_home() / "cache" / "image_references"
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def _download_reference_url(url: str) -> str:
++    """Download a remote image reference into Hermes cache and return its path."""
++    parts = urlsplit(url)
++    if parts.scheme not in {"http", "https"} or not parts.netloc:
++        raise ValueError("reference_image_url must be an http(s) URL")
++
++    safe_url = _redact_url_for_error(url)
++    req = Request(url, headers={"User-Agent": "HermesAgent/1.0 image-reference-fetch"})
++    try:
++        with urlopen(req, timeout=20) as resp:
++            content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
++            if content_type and not content_type.startswith("image/"):
++                raise ValueError(f"reference URL did not return an image: {content_type}")
++            content_length = resp.headers.get("Content-Length")
++            if content_length and int(content_length) > _REFERENCE_DOWNLOAD_MAX_BYTES:
++                raise ValueError("reference image is too large (>25MB)")
++            data = resp.read(_REFERENCE_DOWNLOAD_MAX_BYTES + 1)
++    except Exception as exc:
++        raise ValueError(f"could not download reference image {safe_url}: {exc}") from exc
++
++    if len(data) > _REFERENCE_DOWNLOAD_MAX_BYTES:
++        raise ValueError("reference image is too large (>25MB)")
++    if not data:
++        raise ValueError(f"reference URL returned no data: {safe_url}")
++
++    ext = "png"
++    if content_type == "image/jpeg":
++        ext = "jpg"
++    elif content_type == "image/webp":
++        ext = "webp"
++    elif content_type == "image/gif":
++        ext = "gif"
++    elif content_type == "image/png":
++        ext = "png"
++
++    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++    path = _reference_cache_dir() / f"reference_{ts}_{uuid.uuid4().hex[:8]}.{ext}"
++    path.write_bytes(data)
++    return str(path)
++
++
++def _materialize_reference_inputs(args: Dict[str, Any]) -> tuple[List[str], Optional[str]]:
++    """Normalize local/remote reference args into local image file paths."""
++    references: List[str] = []
++    raw_references = args.get("references") or []
++    if not isinstance(raw_references, list):
++        return [], "references must be a list of image file paths"
++    references.extend(r.strip() for r in raw_references if isinstance(r, str) and r.strip())
++
++    reference_image_path = args.get("reference_image_path")
++    if isinstance(reference_image_path, str) and reference_image_path.strip():
++        references.append(reference_image_path.strip())
++
++    reference_image_url = args.get("reference_image_url")
++    if isinstance(reference_image_url, str) and reference_image_url.strip():
++        try:
++            references.append(_download_reference_url(reference_image_url.strip()))
++        except ValueError as exc:
++            return [], str(exc)
++
++    return references, None
++
++
+ IMAGE_GENERATE_SCHEMA = {
+     "name": "image_generate",
+     "description": (
+-        "Generate high-quality images from text prompts. The underlying "
++        "Generate high-quality images from text prompts, optionally conditioned "
++        "on reference images when the active provider supports them. The underlying "
+         "backend (FAL, OpenAI, etc.) and model are user-configured and not "
+         "selectable by the agent. Returns either a URL or an absolute file "
+         "path in the `image` field; display it with markdown "
+@@ -915,27 +962,25 @@ IMAGE_GENERATE_SCHEMA = {
+                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
+                 "default": DEFAULT_ASPECT_RATIO,
+             },
++            "references": {
++                "type": "array",
++                "items": {"type": "string"},
++                "description": "Optional local image file paths to use as visual references. Only supported by reference-capable providers such as openai-codex.",
++            },
++            "reference_image_path": {
++                "type": "string",
++                "description": "Optional single local image file path to use as a visual reference.",
++            },
++            "reference_image_url": {
++                "type": "string",
++                "description": "Optional HTTP(S) image URL to download immediately into Hermes cache and use as a visual reference. Signed URLs are not persisted in logs or errors.",
++            },
+         },
+         "required": ["prompt"],
+     },
+ }
+ 
+ 
+-def _read_configured_image_model():
+-    """Return the value of ``image_gen.model`` from config.yaml, or None."""
+-    try:
+-        from hermes_cli.config import load_config
+-        cfg = load_config()
+-        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+-        if isinstance(section, dict):
+-            value = section.get("model")
+-            if isinstance(value, str) and value.strip():
+-                return value.strip()
+-    except Exception as exc:
+-        logger.debug("Could not read image_gen.model: %s", exc)
+-    return None
+-
+-
+ def _read_configured_image_provider():
+     """Return the value of ``image_gen.provider`` from config.yaml, or None.
+ 
+@@ -957,7 +1002,7 @@ def _read_configured_image_provider():
+     return None
+ 
+ 
+-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
++def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str, references: Optional[List[str]] = None):
+     """Route the call to a plugin-registered provider when one is selected.
+ 
+     Returns a JSON string on dispatch, or ``None`` to fall through to the
+@@ -972,9 +1017,6 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+     if not configured or configured == "fal":
+         return None
+ 
+-    # Also read configured model so we can pass it to the plugin
+-    configured_model = _read_configured_image_model()
+-
+     try:
+         # Import locally so plugin discovery isn't triggered just by
+         # importing this module (tests rely on that).
+@@ -1009,11 +1051,20 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+             "error_type": "provider_not_registered",
+         })
+ 
++    if references and not getattr(provider, "supports_references", False):
++        return json.dumps({
++            "success": False,
++            "image": None,
++            "error": f"Provider '{getattr(provider, 'name', '?')}' does not support reference images",
++            "error_type": "references_unsupported",
++        })
++
+     try:
+-        kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
+-        if configured_model:
+-            kwargs["model"] = configured_model
+-        result = provider.generate(**kwargs)
++        result = provider.generate(
++            prompt=prompt,
++            aspect_ratio=aspect_ratio,
++            **({"references": references} if references else {}),
++        )
+     except Exception as exc:
+         logger.warning(
+             "Image gen provider '%s' raised: %s",
+@@ -1043,10 +1094,16 @@ def _handle_image_generate(args, **kw):
+ 
+     # Route to a plugin-registered provider if one is active (and it's
+     # not the in-tree FAL path).
+-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
++    references, ref_error = _materialize_reference_inputs(args)
++    if ref_error:
++        return tool_error(ref_error)
++    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, references)
+     if dispatched is not None:
+         return dispatched
+ 
++    if references:
++        return tool_error("Reference images are only supported by plugin image providers such as openai-codex")
++
+     return image_generate_tool(
+         prompt=prompt,
+         aspect_ratio=aspect_ratio,
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 7e1ca19f..217a84f4 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -65,12 +65,10 @@ import ModelsPage from "@/pages/ModelsPage";
+ import CronPage from "@/pages/CronPage";
+ import ProfilesPage from "@/pages/ProfilesPage";
+ import SkillsPage from "@/pages/SkillsPage";
+-import PluginsPage from "@/pages/PluginsPage";
+ import ChatPage from "@/pages/ChatPage";
+ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+ import { ThemeSwitcher } from "@/components/ThemeSwitcher";
+ import { useI18n } from "@/i18n";
+-import type { Translations } from "@/i18n/types";
+ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
+ import type { PluginManifest } from "@/plugins";
+ import { useTheme } from "@/themes";
+@@ -80,14 +78,6 @@ function RootRedirect() {
+   return <Navigate to="/sessions" replace />;
+ }
+ 
+-function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
+-  if (pluginsLoading) {
+-    // Render nothing during the plugin-load window — a spinner here would just flash.
+-    return null;
+-  }
+-  return <Navigate to="/sessions" replace />;
+-}
+-
+ const CHAT_NAV_ITEM: NavItem = {
+   path: "/chat",
+   labelKey: "chat",
+@@ -112,7 +102,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
+   "/logs": LogsPage,
+   "/cron": CronPage,
+   "/skills": SkillsPage,
+-  "/plugins": PluginsPage,
+   "/profiles": ProfilesPage,
+   "/config": ConfigPage,
+   "/env": EnvPage,
+@@ -149,7 +138,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
+   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
+   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
+   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
+-  { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
+   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
+   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
+   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
+@@ -225,22 +213,6 @@ function buildNavItems(
+   return items;
+ }
+ 
+-/** Split merged nav into built-in sidebar entries vs plugin tabs, preserving plugin order hints. */
+-function partitionSidebarNav(
+-  builtIn: NavItem[],
+-  manifests: PluginManifest[],
+-): { coreItems: NavItem[]; pluginItems: NavItem[] } {
+-  const merged = buildNavItems(builtIn, manifests);
+-  const builtinPaths = new Set(builtIn.map((i) => i.path));
+-  const coreItems: NavItem[] = [];
+-  const pluginItems: NavItem[] = [];
+-  for (const item of merged) {
+-    if (builtinPaths.has(item.path)) coreItems.push(item);
+-    else pluginItems.push(item);
+-  }
+-  return { coreItems, pluginItems };
+-}
+-
+ function buildRoutes(
+   builtinRoutes: Record<string, ComponentType>,
+   manifests: PluginManifest[],
+@@ -281,7 +253,6 @@ function buildRoutes(
+ 
+   for (const m of addons) {
+     if (m.tab.hidden) continue;
+-    if (m.tab.path === "/plugins") continue;
+     if (builtinRoutes[m.tab.path]) continue;
+     routes.push({
+       key: `plugin:${m.name}`,
+@@ -292,7 +263,6 @@ function buildRoutes(
+ 
+   for (const m of manifests) {
+     if (!m.tab.hidden) continue;
+-    if (m.tab.path === "/plugins") continue;
+     if (builtinRoutes[m.tab.path] || m.tab.override) continue;
+     routes.push({
+       key: `plugin:hidden:${m.name}`,
+@@ -352,8 +322,8 @@ export default function App() {
+     [embeddedChat],
+   );
+ 
+-  const sidebarNav = useMemo(
+-    () => partitionSidebarNav(builtinNav, manifests),
++  const navItems = useMemo(
++    () => buildNavItems(builtinNav, manifests),
+     [builtinNav, manifests],
+   );
+   const routes = useMemo(
+@@ -506,44 +476,56 @@ export default function App() {
+               aria-label={t.app.navigation}
+             >
+               <ul className="flex flex-col">
+-                {sidebarNav.coreItems.map((item) => (
+-                  <SidebarNavLink
+-                    closeMobile={closeMobile}
+-                    item={item}
+-                    key={item.path}
+-                    t={t}
+-                  />
+-                ))}
++                {navItems.map(({ path, label, labelKey, icon: Icon }) => {
++                  const navLabel = labelKey
++                    ? ((t.app.nav as Record<string, string>)[labelKey] ?? label)
++                    : label;
++                  return (
++                    <li key={path}>
++                      <NavLink
++                        to={path}
++                        end={path === "/sessions"}
++                        onClick={closeMobile}
++                        className={({ isActive }) =>
++                          cn(
++                            "group relative flex items-center gap-3",
++                            "px-5 py-2.5",
++                            "font-mondwest text-[0.8rem] tracking-[0.12em]",
++                            "whitespace-nowrap transition-colors cursor-pointer",
++                            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
++                            isActive
++                              ? "text-midground"
++                              : "opacity-60 hover:opacity-100",
++                          )
++                        }
++                        style={{
++                          clipPath: "var(--component-tab-clip-path)",
++                        }}
++                      >
++                        {({ isActive }) => (
++                          <>
++                            <Icon className="h-3.5 w-3.5 shrink-0" />
++                            <span className="truncate">{navLabel}</span>
++
++                            <span
++                              aria-hidden
++                              className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
++                            />
++
++                            {isActive && (
++                              <span
++                                aria-hidden
++                                className="absolute left-0 top-0 bottom-0 w-px bg-midground"
++                                style={{ mixBlendMode: "plus-lighter" }}
++                              />
++                            )}
++                          </>
++                        )}
++                      </NavLink>
++                    </li>
++                  );
++                })}
+               </ul>
+-
+-              {sidebarNav.pluginItems.length > 0 && (
+-                <div
+-                  aria-labelledby="hermes-sidebar-plugin-nav-heading"
+-                  className="flex flex-col border-t border-current/10 pb-2"
+-                  role="group"
+-                >
+-                  <span
+-                    className={cn(
+-                      "px-5 pt-2.5 pb-1",
+-                      "font-mondwest text-[0.6rem] tracking-[0.15em] uppercase opacity-30",
+-                    )}
+-                    id="hermes-sidebar-plugin-nav-heading"
+-                  >
+-                    {t.app.pluginNavSection}
+-                  </span>
+-
+-                  <ul className="flex flex-col">
+-                    {sidebarNav.pluginItems.map((item) => (
+-                      <SidebarNavLink
+-                        closeMobile={closeMobile}
+-                        item={item}
+-                        key={item.path}
+-                        t={t}
+-                      />
+-                    ))}
+-                  </ul>
+-                </div>
+-              )}
+             </nav>
+ 
+             <SidebarSystemActions onNavigate={closeMobile} />
+@@ -588,12 +570,12 @@ export default function App() {
+                   {routes.map(({ key, path, element }) => (
+                     <Route key={key} path={path} element={element} />
+                   ))}
+-                  <Route
+-                    path="*"
+-                    element={
+-                      <UnknownRouteFallback pluginsLoading={pluginsLoading} />
+-                    }
+-                  />
++                  {!pluginsLoading && (
++                    <Route
++                      path="*"
++                      element={<Navigate to="/sessions" replace />}
++                    />
++                  )}
+                 </Routes>
+ 
+                 {embeddedChat &&
+@@ -635,57 +617,6 @@ export default function App() {
+   );
+ }
+ 
+-function SidebarNavLink({ closeMobile, item, t }: SidebarNavLinkProps) {
+-  const { path, label, labelKey, icon: Icon } = item;
+-
+-  const navLabel = labelKey
+-    ? ((t.app.nav as Record<string, string>)[labelKey] ?? label)
+-    : label;
+-
+-  return (
+-    <li>
+-      <NavLink
+-        to={path}
+-        end={path === "/sessions"}
+-        onClick={closeMobile}
+-        className={({ isActive }) =>
+-          cn(
+-            "group relative flex items-center gap-3",
+-            "px-5 py-2.5",
+-            "font-mondwest text-[0.8rem] tracking-[0.12em]",
+-            "whitespace-nowrap transition-colors cursor-pointer",
+-            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground",
+-            isActive ? "text-midground" : "opacity-60 hover:opacity-100",
+-          )
+-        }
+-        style={{
+-          clipPath: "var(--component-tab-clip-path)",
+-        }}
+-      >
+-        {({ isActive }) => (
+-          <>
+-            <Icon className="h-3.5 w-3.5 shrink-0" />
+-            <span className="truncate">{navLabel}</span>
+-
+-            <span
+-              aria-hidden
+-              className="absolute inset-y-0.5 left-1.5 right-1.5 bg-midground opacity-0 pointer-events-none transition-opacity duration-200 group-hover:opacity-5"
+-            />
+-
+-            {isActive && (
+-              <span
+-                aria-hidden
+-                className="absolute left-0 top-0 bottom-0 w-px bg-midground"
+-                style={{ mixBlendMode: "plus-lighter" }}
+-              />
+-            )}
+-          </>
+-        )}
+-      </NavLink>
+-    </li>
+-  );
+-}
+-
+ function SidebarSystemActions({ onNavigate }: { onNavigate: () => void }) {
+   const { t } = useI18n();
+   const navigate = useNavigate();
+@@ -804,12 +735,6 @@ interface NavItem {
+   path: string;
+ }
+ 
+-interface SidebarNavLinkProps {
+-  closeMobile: () => void;
+-  item: NavItem;
+-  t: Translations;
+-}
+-
+ interface SystemActionItem {
+   action: SystemAction;
+   icon: ComponentType<{ className?: string }>;
+-- 
+2.43.0
+
