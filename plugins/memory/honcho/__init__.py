@@ -20,10 +20,12 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -234,6 +236,13 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Port #4053: cron guard — when True, plugin is fully inactive
         self._cron_skipped = False
+
+        # Optional curated memory cache. This lets a compact, auditable file
+        # (for example Obsidian/G-Brain output) be injected instead of raw
+        # Honcho context() fragments. Configure with curatedContextPath in
+        # honcho.json, either at the root or under hosts.<host>.
+        self._curated_context_cache: str = ""
+        self._curated_context_mtime: float = -1.0
 
     @property
     def name(self) -> str:
@@ -575,6 +584,52 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return "\n\n".join(parts)
 
+    def _curated_context_path(self) -> Optional[Path]:
+        """Return configured curated context cache path, if enabled."""
+        if not self._config:
+            return None
+
+        raw = getattr(self._config, "raw", {}) or {}
+        host_block = (raw.get("hosts") or {}).get(getattr(self._config, "host", ""), {}) or {}
+        value = (
+            host_block.get("curatedContextPath")
+            or raw.get("curatedContextPath")
+            or host_block.get("curatedCachePath")
+            or raw.get("curatedCachePath")
+        )
+        if not value or str(value).strip().lower() in {"false", "off", "none", "null"}:
+            return None
+
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = get_hermes_home() / path
+        return path
+
+    def _load_curated_context(self) -> str:
+        """Read the curated cache, cached by mtime and bounded by contextTokens."""
+        path = self._curated_context_path()
+        if not path:
+            return ""
+        try:
+            stat = path.stat()
+        except OSError:
+            return ""
+
+        if stat.st_mtime != self._curated_context_mtime:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.debug("Honcho curated context cache read failed: %s", exc)
+                text = ""
+            self._curated_context_cache = text
+            self._curated_context_mtime = stat.st_mtime
+
+        if not self._curated_context_cache:
+            return ""
+
+        block = "## Curated Memory Cache\n" + self._curated_context_cache
+        return self._truncate_to_budget(block)
+
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
 
@@ -626,16 +681,24 @@ class HonchoMemoryProvider(MemoryProvider):
         1. Base context from peer.context() — cached, refreshed on context_cadence
         2. Dialectic supplement — cached, refreshed on dialectic_cadence
 
-        B1: Returns empty when recall_mode is "tools" (no injection).
+        B1: Returns empty when recall_mode is "tools" (no Honcho API injection),
+            except for an explicitly configured curated cache file.
         B5: Respects injection_frequency — "first-turn" returns cached/empty after turn 0.
         Port #3265: Truncates to context_tokens budget.
         """
         if self._cron_skipped:
             return ""
 
-        # B1: tools-only mode — no auto-injection
+        curated_context = self._load_curated_context()
+
+        # B1: tools-only mode — no raw Honcho auto-injection. If a curated
+        # cache file is configured, inject that compact source instead.
         if self._recall_mode == "tools":
-            return ""
+            if self._injection_frequency == "first-turn" and self._turn_count > 1:
+                return ""
+            if self._is_trivial_prompt(query):
+                return ""
+            return curated_context
 
         if not self._session_ready():
             self._start_session_init_background()
@@ -652,29 +715,35 @@ class HonchoMemoryProvider(MemoryProvider):
 
         parts = []
 
-        # ----- Layer 1: Base context (representation + card) -----
-        # First fetch is asynchronous: a slow Honcho backend must not block the
-        # first response. Serve empty context now and consume the background
-        # result on a later turn.
-        with self._base_context_lock:
-            if self._base_context_cache is None:
-                self._base_context_cache = ""
-                self._last_context_turn = self._turn_count
-                try:
-                    self._manager.prefetch_context(self._session_key, query or None)
-                except Exception as e:
-                    logger.debug("Honcho base context prefetch failed: %s", e)
-            base_context = self._base_context_cache
+        # ----- Layer 1: Base context -----
+        # Prefer the curated cache when configured: it is compact, auditable,
+        # and avoids dumping raw Honcho observations into the prompt.
+        if curated_context:
+            base_context = curated_context
+        else:
+            # Raw Honcho context fallback (representation + card). First fetch
+            # is asynchronous: a slow Honcho backend must not block the first
+            # response. Serve empty context now and consume the background
+            # result on a later turn.
+            with self._base_context_lock:
+                if self._base_context_cache is None:
+                    self._base_context_cache = ""
+                    self._last_context_turn = self._turn_count
+                    try:
+                        self._manager.prefetch_context(self._session_key, query or None)
+                    except Exception as e:
+                        logger.debug("Honcho base context prefetch failed: %s", e)
+                base_context = self._base_context_cache
 
-        # Check if background context prefetch has a fresher result
-        if self._manager:
-            fresh_ctx = self._manager.pop_context_result(self._session_key)
-            if fresh_ctx:
-                formatted = self._format_first_turn_context(fresh_ctx)
-                if formatted:
-                    with self._base_context_lock:
-                        self._base_context_cache = formatted
-                    base_context = formatted
+            # Check if background context prefetch has a fresher result.
+            if self._manager:
+                fresh_ctx = self._manager.pop_context_result(self._session_key)
+                if fresh_ctx:
+                    formatted = self._format_first_turn_context(fresh_ctx)
+                    if formatted:
+                        with self._base_context_lock:
+                            self._base_context_cache = formatted
+                        base_context = formatted
 
         if base_context:
             parts.append(base_context)
@@ -800,7 +869,11 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         # ----- Context refresh (base layer) — independent cadence -----
-        if self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence:
+        # When a curated cache is configured, do not spend Honcho context()
+        # calls or replace the curated layer with raw representation/card data.
+        if self._curated_context_path():
+            pass
+        elif self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence:
             self._last_context_turn = self._turn_count
             try:
                 self._manager.prefetch_context(self._session_key, query)

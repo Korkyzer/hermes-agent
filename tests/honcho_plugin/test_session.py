@@ -675,6 +675,38 @@ class TestToolsModeInitBehavior:
         )
         assert provider.prefetch("test query") == ""
 
+    def test_tools_mode_injects_configured_curated_cache(self, tmp_path):
+        """tools mode may inject an explicit curated cache without raw Honcho calls."""
+        provider, cfg, _ = self._make_provider_with_config(
+            recall_mode="tools", init_on_session_start=False,
+        )
+        cache = tmp_path / "memory" / "honcho_curated_context.md"
+        cache.parent.mkdir()
+        cache.write_text("- Uses Honcho for semantic memory\n- Obsidian is source of truth", encoding="utf-8")
+        cfg.raw = {"hosts": {"hermes": {"curatedContextPath": "memory/honcho_curated_context.md"}}}
+        provider._turn_count = 1
+
+        from unittest.mock import patch
+        with patch("plugins.memory.honcho.get_hermes_home", return_value=tmp_path):
+            result = provider.prefetch("what is my memory architecture?")
+
+        assert "## Curated Memory Cache" in result
+        assert "Obsidian is source of truth" in result
+
+    def test_tools_mode_curated_cache_respects_first_turn_frequency(self, tmp_path):
+        provider, cfg, _ = self._make_provider_with_config(
+            recall_mode="tools", init_on_session_start=False,
+        )
+        cache = tmp_path / "cache.md"
+        cache.write_text("compact cache", encoding="utf-8")
+        cfg.raw = {"curatedContextPath": "cache.md"}
+        provider._injection_frequency = "first-turn"
+        provider._turn_count = 2
+
+        from unittest.mock import patch
+        with patch("plugins.memory.honcho.get_hermes_home", return_value=tmp_path):
+            assert provider.prefetch("what is my memory architecture?") == ""
+
     def test_explicit_peer_name_not_overridden_by_user_id(self):
         """Explicit peerName in config must not be replaced by gateway user_id."""
         _, cfg, _ = self._make_provider_with_config(
