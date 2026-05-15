@@ -921,6 +921,10 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+                if "auto_thread_archive_default" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_DEFAULT"):
+                    os.environ["DISCORD_AUTO_THREAD_ARCHIVE_DEFAULT"] = str(discord_cfg["auto_thread_archive_default"])
+                if "auto_thread_archive_smart" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_SMART"):
+                    os.environ["DISCORD_AUTO_THREAD_ARCHIVE_SMART"] = str(discord_cfg["auto_thread_archive_smart"]).lower()
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
                 # ignored_channels: channels where bot never responds (even when mentioned)
