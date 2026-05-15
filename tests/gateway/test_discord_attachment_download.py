@@ -358,3 +358,56 @@ class TestHandleMessageUsesAuthenticatedRead:
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == ["/tmp/img_from_read.png"]
         assert event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_html_document_is_cached_and_text_injected(self, monkeypatch):
+        """HTML Discord attachments are supported as text documents."""
+        adapter = _make_adapter()
+        adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+        adapter.handle_message = AsyncMock()
+
+        html_bytes = b"<html><body><h1>Reference canvas</h1></body></html>"
+        att = SimpleNamespace(
+            url="https://cdn.discordapp.com/attachments/fake/reference.html",
+            filename="reference.html",
+            content_type="text/html; charset=utf-8",
+            size=len(html_bytes),
+            read=AsyncMock(return_value=html_bytes),
+        )
+
+        from datetime import datetime, timezone
+
+        class _FakeDMChannel:
+            id = 100
+            name = "dm"
+
+        monkeypatch.setattr(
+            "gateway.platforms.discord.discord.DMChannel",
+            _FakeDMChannel,
+        )
+        chan = _FakeDMChannel()
+        msg = SimpleNamespace(
+            id=2,
+            content="voici le HTML",
+            attachments=[att],
+            mentions=[],
+            reference=None,
+            created_at=datetime.now(timezone.utc),
+            channel=chan,
+            author=SimpleNamespace(id=42, display_name="U", name="U"),
+        )
+
+        with patch(
+            "gateway.platforms.discord.cache_document_from_bytes",
+            return_value="/tmp/doc_reference.html",
+        ) as mock_cache:
+            await adapter._handle_message(msg)
+
+        mock_cache.assert_called_once_with(html_bytes, "reference.html")
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type.value == "document"
+        assert event.media_urls == ["/tmp/doc_reference.html"]
+        assert event.media_types == ["text/html"]
+        assert "[Content of reference.html]:" in event.text
+        assert "<h1>Reference canvas</h1>" in event.text
+        assert "voici le HTML" in event.text

@@ -819,6 +819,8 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".csv": "text/csv",
     ".log": "text/plain",
     ".json": "application/json",
+    ".html": "text/html",
+    ".htm": "text/html",
     ".xml": "application/xml",
     ".yaml": "application/yaml",
     ".yml": "application/yaml",
