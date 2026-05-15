@@ -20,10 +20,12 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
+from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import spawn_context_thread
 from tools.registry import tool_error
 
@@ -323,6 +325,13 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+
+        # Optional curated memory cache. This lets a compact, auditable file
+        # (for example Obsidian/G-Brain output) be injected instead of raw
+        # Honcho context() fragments. Configure with curatedContextPath in
+        # honcho.json, either at the root or under hosts.<host>.
+        self._curated_context_cache: str = ""
+        self._curated_context_mtime: float = -1.0
 
     @property
     def name(self) -> str:
@@ -676,6 +685,52 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return "\n\n".join(parts)
 
+    def _curated_context_path(self) -> Optional[Path]:
+        """Return configured curated context cache path, if enabled."""
+        if not self._config:
+            return None
+
+        raw = getattr(self._config, "raw", {}) or {}
+        host_block = (raw.get("hosts") or {}).get(getattr(self._config, "host", ""), {}) or {}
+        value = (
+            host_block.get("curatedContextPath")
+            or raw.get("curatedContextPath")
+            or host_block.get("curatedCachePath")
+            or raw.get("curatedCachePath")
+        )
+        if not value or str(value).strip().lower() in {"false", "off", "none", "null"}:
+            return None
+
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = get_hermes_home() / path
+        return path
+
+    def _load_curated_context(self) -> str:
+        """Read the curated cache, cached by mtime and bounded by contextTokens."""
+        path = self._curated_context_path()
+        if not path:
+            return ""
+        try:
+            stat = path.stat()
+        except OSError:
+            return ""
+
+        if stat.st_mtime != self._curated_context_mtime:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.debug("Honcho curated context cache read failed: %s", exc)
+                text = ""
+            self._curated_context_cache = text
+            self._curated_context_mtime = stat.st_mtime
+
+        if not self._curated_context_cache:
+            return ""
+
+        block = "## Curated Memory Cache\n" + self._curated_context_cache
+        return self._truncate_to_budget(block)
+
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
 
@@ -726,15 +781,21 @@ class HonchoMemoryProvider(MemoryProvider):
         1. Base context from peer.context() — cached, refreshed on context_cadence
         2. Dialectic supplement — cached, refreshed on dialectic_cadence
 
-        Returns empty in tools-only mode and respects the configured injection
-        frequency and context budget.
+        Returns empty in tools-only mode (unless a curated cache is configured)
+        and respects the configured injection frequency and context budget.
         """
         if self._cron_skipped:
             return ""
 
-        # Tools-only mode has no automatic injection.
+        curated_context = self._load_curated_context()
+
+        # Tools-only mode: no raw Honcho auto-injection; inject curated cache instead.
         if self._recall_mode == "tools":
-            return ""
+            if self._injection_frequency == "first-turn" and self._turn_count > 1:
+                return ""
+            if self._is_trivial_prompt(query):
+                return ""
+            return curated_context
 
         first_turn_base_deadline = None
         if self._turn_count <= 1:
@@ -774,10 +835,12 @@ class HonchoMemoryProvider(MemoryProvider):
         if auth_notice:
             parts.append(auth_notice)
 
-        # ----- Layer 1: Base context (representation + card) -----
-        if not _skip_base:
-            # The first base fetch gets the remaining turn-1 budget. Later
-            # refreshes are consumed asynchronously.
+        # ----- Layer 1: Base context -----
+        # A configured curated cache replaces raw Honcho context; otherwise keep
+        # the upstream first-turn/async refresh behavior unchanged.
+        if curated_context:
+            parts.append(curated_context)
+        elif not _skip_base:
             with self._base_context_lock:
                 _first_base_fetch = self._base_context_cache is None
                 if _first_base_fetch:
@@ -821,7 +884,6 @@ class HonchoMemoryProvider(MemoryProvider):
                         "will surface on next turn", _base_wait,
                     )
 
-            # Later turns consume the refresh queued by the previous turn.
             if not _first_base_fetch and self._manager:
                 fresh_ctx = self._manager.pop_context_result(self._session_key)
                 if fresh_ctx:
@@ -977,12 +1039,15 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._is_trivial_prompt(query):
             return
 
-        # First-turn-only base context never needs a later refresh.
-        context_due = (
+        # Context refresh (base layer) — independent cadence.
+        # Curated-cache mode never refreshes raw Honcho context.
+        # First-turn-only mode also skips periodic refreshes.
+        if self._curated_context_path():
+            pass
+        elif self._injection_frequency != "first-turn" and (
             self._context_cadence <= 1
             or (self._turn_count - self._last_context_turn) >= self._context_cadence
-        )
-        if self._injection_frequency != "first-turn" and context_due:
+        ):
             self._last_context_turn = self._turn_count
             try:
                 self._manager.prefetch_context(self._session_key, query)
