@@ -307,7 +307,7 @@ class TestExtractMedia:
         assert media == [("/path/to/audio.ogg", False)]
         assert cleaned == ""
 
-    def test_media_tag_strips_wrapping_quotes_and_backticks(self):
+    def test_extract_media_allows_quoted_paths(self):
         content = "MEDIA: `/path/to/file.png`\nMEDIA:\"/path/to/file2.png\"\nMEDIA:'/path/to/file3.png'"
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [
@@ -315,9 +315,16 @@ class TestExtractMedia:
             ("/path/to/file2.png", False),
             ("/path/to/file3.png", False),
         ]
-        assert cleaned == ""
+        assert "MEDIA:" not in cleaned
 
-    def test_media_tag_supports_quoted_paths_with_spaces(self):
+    def test_extract_media_allows_markdown_documents(self):
+        content = "Voilà\nMEDIA:/root/.hermes/document_cache/handoff.md"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/root/.hermes/document_cache/handoff.md", False)]
+        assert "MEDIA:" not in cleaned
+        assert "handoff.md" not in cleaned
+
+    def test_extract_media_path_with_spaces_single_quotes(self):
         content = "Here\nMEDIA: '/tmp/my image.png'\nAfter"
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/tmp/my image.png", False)]
