@@ -228,10 +228,17 @@ def normalize_reference_images(value: Any) -> Optional[List[str]]:
 
 
 def _images_cache_dir() -> Path:
-    """Return ``$HERMES_HOME/cache/images/``, creating parents as needed."""
-    from hermes_constants import get_hermes_home
+    """Return the Hermes image cache dir, creating parents as needed.
 
-    path = get_hermes_home() / "cache" / "images"
+    Use the same backward-compatible resolver as the gateway delivery code:
+    existing installs with ``$HERMES_HOME/image_cache`` keep writing there,
+    while fresh installs use ``$HERMES_HOME/cache/images``. This prevents
+    generated image paths from landing outside the gateway attachment
+    allowlist when both legacy and consolidated cache layouts coexist.
+    """
+    from hermes_constants import get_hermes_dir
+
+    path = get_hermes_dir("cache/images", "image_cache")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
