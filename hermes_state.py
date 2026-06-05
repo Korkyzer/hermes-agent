@@ -3495,6 +3495,7 @@ class SessionDB:
     def session_count(
         self,
         source: str = None,
+        exclude_sources: Optional[List[str]] = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
