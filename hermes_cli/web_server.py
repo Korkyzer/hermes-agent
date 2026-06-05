@@ -4453,6 +4453,7 @@ def get_sessions(
     cwd_prefix: str = None,
     full: bool = False,
     profile: Optional[str] = None,
+    include_cron: bool = False,
 ):
     """List sessions.
 
@@ -4468,6 +4469,11 @@ def get_sessions(
 
     Rows omit ``system_prompt``/``model_config`` (the payload-dominating
     fields no list UI reads) unless ``full=1`` is passed.
+
+    Internal/non-human runs are hidden by default from the human session picker
+    (cron scheduler runs, API-server integration calls, ACP worker sessions).
+    Cron runs remain available in the Cron dashboard/output views and can be
+    included here for admin/debug use with ``include_cron=true``.
     """
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(
@@ -4489,13 +4495,20 @@ def get_sessions(
             archived_only = archived == "only"
             include_archived = archived == "include"
             # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+            # ``exclude_sources`` (comma-separated) drops classes. If neither is
+            # set, hide non-human/internal sources from the session picker.
+            explicit_exclude = [item.strip() for item in (exclude_sources or "").split(",") if item.strip()]
+            if source:
+                effective_exclude_sources = explicit_exclude or None
+            elif explicit_exclude:
+                effective_exclude_sources = explicit_exclude
+            elif include_cron:
+                effective_exclude_sources = ["api_server", "acp"]
+            else:
+                effective_exclude_sources = ["cron", "api_server", "acp"]
             sessions = db.list_sessions_rich(
                 source=source or None,
-                exclude_sources=exclude_list or None,
+                exclude_sources=effective_exclude_sources,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
                 offset=offset,
@@ -4511,7 +4524,7 @@ def get_sessions(
             total = db.session_count(
                 source=source or None,
                 cwd_prefix=(cwd_prefix or None),
-                exclude_sources=exclude_list or None,
+                exclude_sources=effective_exclude_sources,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -4801,23 +4814,40 @@ def get_profiles_sessions_sidebar(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
-    """Search sessions by ID plus full-text message content using FTS5.
+async def search_sessions(q: str = "", limit: int = 20, include_cron: bool = False):
+    """Full-text search across session message content using FTS5.
 
-    Direct session-id matches are surfaced first, then FTS message-content
-    matches. Results are deduped by compression lineage, not by raw
-    ``session_id``. Auto-compression rotates a conversation onto a fresh
-    session id (and leaves the old segment's messages in the FTS index), so one
-    logical chat can own many ``sessions`` rows that all match the same query.
-    Branches also use ``parent_session_id``, but they are real alternate
-    conversations; don't collapse branch-specific hits back into the parent.
+    Results are deduped by compression lineage, not by raw ``session_id``.
+    ``recent`` keeps a long-running conversation on the first page
+    after it auto-compresses into a fresh continuation id.
+
+    Internal/non-human runs are hidden by default (cron, api_server, acp).
+    Include them for admin/debug with ``include_cron=true``.
     """
     if not q or not q.strip():
         return {"results": []}
     try:
         db = _open_session_db_for_profile(profile)
         try:
-            safe_limit = max(1, min(int(limit or 20), 100))
+            # Auto-add prefix wildcards so partial words match
+            # e.g. "nimb" -> "nimb*" matches "nimby"
+            # Preserve quoted phrases and existing wildcards as-is
+            import re
+            terms = []
+            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
+                if token.startswith('"') or token.endswith("*"):
+                    terms.append(token)
+                else:
+                    terms.append(token + "*")
+            prefix_query = " ".join(terms)
+            # Over-fetch so lineage dedup can still surface `limit` distinct
+            # conversations even when several hits collapse onto one root.
+            fetch_limit = max(limit * 5, 50)
+            matches = db.search_messages(
+                query=prefix_query,
+                limit=fetch_limit,
+                exclude_sources=["api_server", "acp"] if include_cron else ["cron", "api_server", "acp"],
+            )
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
