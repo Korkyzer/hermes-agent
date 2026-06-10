@@ -1851,7 +1851,6 @@ async def get_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 order_by_last_active=order == "recent",
-                exclude_sources=exclude_sources,
             )
             total = db.session_count(
                 source=source or None,
@@ -1860,7 +1859,6 @@ async def get_sessions(
                 include_archived=include_archived,
                 archived_only=archived_only,
                 exclude_children=True,
-                exclude_sources=exclude_sources,
             )
             now = time.time()
             for s in sessions:

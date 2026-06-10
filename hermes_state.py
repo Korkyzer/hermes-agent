@@ -3500,7 +3500,6 @@ class SessionDB:
         include_archived: bool = False,
         archived_only: bool = False,
         exclude_children: bool = False,
-        exclude_sources: List[str] = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
