@@ -2015,6 +2015,8 @@ async def search_sessions(q: str = "", limit: int = 20, include_cron: bool = Fal
         from hermes_state import SessionDB
         db = SessionDB()
         try:
+            safe_limit = max(1, min(int(limit or 20), 100))
+
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" -> "nimb*" matches "nimby"
             # Preserve quoted phrases and existing wildcards as-is
