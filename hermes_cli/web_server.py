@@ -4450,10 +4450,10 @@ def get_sessions(
     order: str = "created",
     source: str = None,
     exclude_sources: str = None,
+    include_cron: bool = False,
     cwd_prefix: str = None,
     full: bool = False,
     profile: Optional[str] = None,
-    include_cron: bool = False,
 ):
     """List sessions.
 
@@ -4494,18 +4494,15 @@ def get_sessions(
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
             include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. If neither is
-            # set, hide non-human/internal sources from the session picker.
-            explicit_exclude = [item.strip() for item in (exclude_sources or "").split(",") if item.strip()]
-            if source:
-                effective_exclude_sources = explicit_exclude or None
-            elif explicit_exclude:
-                effective_exclude_sources = explicit_exclude
-            elif include_cron:
-                effective_exclude_sources = ["api_server", "acp"]
+            # Optional source scoping: explicit ``source`` / ``exclude_sources``
+            # wins; otherwise hide internal runs from the human session picker.
+            if exclude_sources is not None:
+                exclude_list = [item.strip() for item in exclude_sources.split(",") if item.strip()]
+            elif source:
+                exclude_list = []
             else:
-                effective_exclude_sources = ["cron", "api_server", "acp"]
+                exclude_list = ["api_server", "acp"] if include_cron else ["cron", "api_server", "acp"]
+            effective_exclude_sources = exclude_list or None
             sessions = db.list_sessions_rich(
                 source=source or None,
                 exclude_sources=effective_exclude_sources,
@@ -4563,6 +4560,7 @@ def get_profiles_sessions(
     profile: str = "all",
     source: str = None,
     exclude_sources: str = None,
+    include_cron: bool = False,
     full: bool = False,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
@@ -4606,7 +4604,12 @@ def get_profiles_sessions(
     # the cron-jobs section passes source=cron — two independent lists so
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    if exclude_sources is not None:
+        exclude_list = [s.strip() for s in exclude_sources.split(",") if s.strip()]
+    elif source_filter:
+        exclude_list = []
+    else:
+        exclude_list = ["api_server", "acp"] if include_cron else ["cron", "api_server", "acp"]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -4814,7 +4817,12 @@ def get_profiles_sessions_sidebar(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, include_cron: bool = False):
+async def search_sessions(
+    q: str = "",
+    limit: int = 20,
+    include_cron: bool = False,
+    profile: Optional[str] = None,
+):
     """Full-text search across session message content using FTS5.
 
     Results are deduped by compression lineage, not by raw ``session_id``.
@@ -4830,26 +4838,7 @@ async def search_sessions(q: str = "", limit: int = 20, include_cron: bool = Fal
         db = _open_session_db_for_profile(profile)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
-
-            # Auto-add prefix wildcards so partial words match
-            # e.g. "nimb" -> "nimb*" matches "nimby"
-            # Preserve quoted phrases and existing wildcards as-is
-            import re
-            terms = []
-            for token in re.findall(r'"[^"]*"|\S+', q.strip()):
-                if token.startswith('"') or token.endswith("*"):
-                    terms.append(token)
-                else:
-                    terms.append(token + "*")
-            prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(limit * 5, 50)
-            matches = db.search_messages(
-                query=prefix_query,
-                limit=fetch_limit,
-                exclude_sources=["api_server", "acp"] if include_cron else ["cron", "api_server", "acp"],
-            )
+            exclude_list = ["api_server", "acp"] if include_cron else ["cron", "api_server", "acp"]
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -4971,7 +4960,11 @@ async def search_sessions(q: str = "", limit: int = 20, include_cron: bool = Fal
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+            matches = db.search_messages(
+                query=prefix_query,
+                limit=fetch_limit,
+                exclude_sources=exclude_list,
+            )
 
             for m in matches:
                 if len(seen) >= safe_limit:
