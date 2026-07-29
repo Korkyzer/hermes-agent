@@ -7411,7 +7411,7 @@ class DiscordAdapter(BasePlatformAdapter):
         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
         burn through to the caller's failure path (#20243).
         """
-        content = _strip_discord_mentions(message.content or "")
+        content = message.content or ""
         thread_name = self._derive_auto_thread_name(content)
         auto_archive_duration = _smart_auto_thread_archive_duration(content)
 
