@@ -718,6 +718,19 @@ def detect_self_repo_git_mutation(
     if root is None or not command:
         return False, None
 
+    # A bare ``hermes update`` performs the same live-checkout rewrite as the
+    # Git mutations below, but it bypasses the Git-subcommand parser. Running
+    # it from the gateway's terminal tool hot-swaps Python modules underneath
+    # the long-lived process and can also race SQLite state writes. The
+    # explicit gateway /update flow is detached and coordinated separately;
+    # this guard only blocks agent terminal commands.
+    if re.search(
+        r"(?<![A-Za-z0-9_-])(?:hermes(?:\.exe)?|hermes_cli\.main)\s+update(?:\s|$)",
+        command,
+        re.IGNORECASE,
+    ):
+        return True, _block_message("hermes update", root)
+
     root = _resolve(str(root), Path("/"))
     base = _resolve(cwd, Path("/")) if cwd else Path("/")
     operation = _find_mutation(command, base, root)
