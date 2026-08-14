@@ -54,6 +54,12 @@ class TestBlocksMutationsInSourceRepo:
         hit, _ = _detect("git checkout main", repo / "agent", repo)
         assert hit is True
 
+    def test_hermes_update_is_blocked(self, repo):
+        hit, msg = _detect("hermes update --yes", repo, repo)
+        assert hit is True
+        assert msg is not None
+        assert "hermes update" in msg
+
     def test_dash_c_targeting_repo_from_outside(self, repo, tmp_path):
         hit, _ = _detect(f"git -C {repo} checkout pr-51020", tmp_path, repo)
         assert hit is True
