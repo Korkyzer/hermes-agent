@@ -227,6 +227,46 @@ class TestRecordFileMutationResult:
         # the initial root cause.
         assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
 
+    def test_later_external_write_clears_stale_failure(self, tmp_path):
+        """A successful non-file tool write supersedes a refused patch."""
+        agent = _bare_agent()
+        path = tmp_path / "config.yaml"
+        args = {
+            "mode": "replace",
+            "path": str(path),
+            "old_string": "old",
+            "new_string": "new",
+        }
+        agent._record_file_mutation_result(
+            "patch",
+            args,
+            json.dumps({"error": "protected file; use the config command"}),
+            is_error=True,
+        )
+        state = getattr(agent, "_turn_failed_file_mutations")
+        assert str(path) in state
+
+        # Simulates ``hermes config set`` writing through terminal.
+        path.write_text("new\n")
+        agent._reconcile_file_mutation_failures()
+
+        assert getattr(agent, "_turn_failed_file_mutations") == {}
+
+    def test_unchanged_external_target_keeps_failure(self, tmp_path):
+        agent = _bare_agent()
+        path = tmp_path / "config.yaml"
+        path.write_text("old\n")
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(path), "old_string": "missing", "new_string": "new"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+
+        agent._reconcile_file_mutation_failures()
+
+        assert str(path) in getattr(agent, "_turn_failed_file_mutations")
+
 
 
 
