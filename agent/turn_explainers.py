@@ -206,6 +206,17 @@ def _display_flag_enabled(agent, *, env_var: str, config_key: str, cache_attr: s
         return True
 
 
+def _file_mutation_signature(path: str) -> tuple[Any, ...] | None:
+    """Return file metadata without reading contents for verifier reconciliation."""
+    try:
+        stat = os.stat(os.path.expanduser(path))
+    except FileNotFoundError:
+        return ("missing",)
+    except OSError:
+        return None
+    return ("present", stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
 class TurnExplainersMixin:
     """File-mutation failure footer + turn-completion explainer (see module docstring)."""
 
@@ -242,9 +253,25 @@ class TurnExplainersMixin:
             # Keep the FIRST error per path unless a later success replaces it.
             preview = _extract_error_preview(result)
             for path in targets:
-                state.setdefault(path, {"tool": tool_name, "error_preview": preview})
+                state.setdefault(path, {
+                    "tool": tool_name,
+                    "error_preview": preview,
+                    "_file_signature_before": _file_mutation_signature(path),
+                })
         else:
             for path in targets:
+                state.pop(path, None)
+
+    def _reconcile_file_mutation_failures(self) -> None:
+        """Clear a failed file-tool entry when another tool changed that path later."""
+        state = getattr(self, "_turn_failed_file_mutations", None)
+        if not state:
+            return
+        for path, info in list(state.items()):
+            if not isinstance(info, dict) or "_file_signature_before" not in info:
+                continue
+            before = info.get("_file_signature_before")
+            if before is not None and _file_mutation_signature(path) != before:
                 state.pop(path, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
