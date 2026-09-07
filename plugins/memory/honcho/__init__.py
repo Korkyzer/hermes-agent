@@ -14,11 +14,13 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider, is_trivial_prompt
 from agent.turn_author import a2a_key
+from hermes_constants import get_hermes_home
 from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path, spawn_context_thread
 from plugins.memory.honcho.dialectic import DialecticMixin
 from plugins.memory.honcho.session_peers import assistant_peer_id_for, sanitize_peer_id
@@ -152,6 +154,9 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._init_auth_failure: Optional[str] = None
         self._init_auth_notice_emitted = False
         self._cron_skipped = False  # cron and flush contexts disable the plugin entirely
+        # Optional local curated cache; it replaces raw Honcho context when configured.
+        self._curated_context_cache = ""
+        self._curated_context_mtime_ns = -1
 
     @property
     def name(self) -> str:
@@ -378,6 +383,51 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         """Format the prefetch context dict into a readable system prompt block."""
         return "\n\n".join(f"## {header}\n{ctx.get(key, '')}" for key, header in _CONTEXT_SECTIONS if ctx.get(key, ""))
 
+    def _curated_context_path(self) -> Optional[Path]:
+        """Resolve the optional local curated context file for the active Honcho host."""
+        cfg = self._config
+        raw = getattr(cfg, "raw", {}) or {}
+        if not cfg or not raw:
+            return None
+        host_block = (raw.get("hosts") or {}).get(getattr(cfg, "host", ""), {}) or {}
+        value = (
+            host_block.get("curatedContextPath")
+            or raw.get("curatedContextPath")
+            or host_block.get("curatedCachePath")
+            or raw.get("curatedCachePath")
+        )
+        if not value or str(value).strip().lower() in {"false", "off", "none", "null"}:
+            return None
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = (getattr(cfg, "hermes_home", None) or get_hermes_home()) / path
+        return path
+
+    def _load_curated_context(self) -> str:
+        """Read and budget the curated cache, refreshing only when its mtime changes."""
+        path = self._curated_context_path()
+        if path is None:
+            self._curated_context_cache = ""
+            self._curated_context_mtime_ns = -1
+            return ""
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            self._curated_context_cache = ""
+            self._curated_context_mtime_ns = -1
+            return ""
+        if mtime_ns != self._curated_context_mtime_ns:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.debug("Honcho curated context cache read failed: %s", exc)
+                text = ""
+            self._curated_context_cache = text
+            self._curated_context_mtime_ns = mtime_ns
+        if not self._curated_context_cache:
+            return ""
+        return self._truncate_to_budget("## Curated Memory Cache\n" + self._curated_context_cache)
+
     def system_prompt_block(self) -> str:
         """Static mode header + tool instructions (prompt-cache friendly).
         Live context (representation, card) is injected via prefetch()."""
@@ -455,10 +505,21 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         """Base context (representation + card, refreshed on context_cadence) plus the
         dialectic supplement (refreshed on dialectic_cadence), within the context budget.
         Empty in tools-only mode."""
-        if self._cron_skipped or self._recall_mode == "tools":
+        if self._cron_skipped:
             return ""
 
+        curated_context = self._load_curated_context()
+        if self._recall_mode == "tools":
+            if self._injection_frequency == "first-turn" and self._turn_count > 1:
+                return ""
+            if self._is_trivial_prompt(query):
+                return ""
+            return curated_context
+
         if self._recall_sync:
+            # A curated local cache replaces raw Honcho context, sync recall included.
+            if curated_context:
+                return curated_context
             from plugins.memory.honcho.recall_sync import prefetch_sync
             notice = self._pop_auth_notice()
             result = prefetch_sync(self, query)
@@ -485,7 +546,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         parts = [self._pop_auth_notice()]
         # First-turn mode suppresses only the base layer; dialectic is independent.
         if not (self._injection_frequency == "first-turn" and self._turn_count > 1):
-            parts.append(self._fetch_base_context_layer(query, first_turn_base_deadline))
+            parts.append(curated_context or self._fetch_base_context_layer(query, first_turn_base_deadline))
         self._first_turn_dialectic_wait(query)
         # Consume only results that are already ready; later turns never wait.
         parts.append(self._consume_pending_dialectic())
@@ -531,14 +592,15 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         if self._is_trivial_prompt(query):
             return
 
-        # First-turn-only base context never needs a later refresh.
-        context_due = self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence
-        if self._injection_frequency != "first-turn" and context_due:
-            self._last_context_turn = self._turn_count
-            try:
-                self._manager.prefetch_context(self._session_key, query)
-            except Exception as e:
-                logger.debug("Honcho context prefetch failed: %s", e)
+        # A curated local cache replaces raw context refreshes.
+        if self._curated_context_path() is None:
+            context_due = self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence
+            if self._injection_frequency != "first-turn" and context_due:
+                self._last_context_turn = self._turn_count
+                try:
+                    self._manager.prefetch_context(self._session_key, query)
+                except Exception as e:
+                    logger.debug("Honcho context prefetch failed: %s", e)
 
         # Dialectic layer: a hung call older than timeout × multiplier counts as dead.
         if self._thread_is_live():

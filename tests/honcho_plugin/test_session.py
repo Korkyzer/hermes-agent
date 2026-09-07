@@ -255,6 +255,42 @@ class TestToolsModeInitBehavior:
         assert provider._manager is None
         assert provider._lazy_init_kwargs is not None
 
+    def test_tools_mode_injects_curated_context_cache(self, tmp_path):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cache = tmp_path / "honcho_curated_context.md"
+        cache.write_text("- Obsidian is the curated memory source", encoding="utf-8")
+        cfg = HonchoClientConfig(
+            api_key="test-key", enabled=True, recall_mode="tools",
+            raw={"curatedContextPath": str(cache)}, hermes_home=tmp_path,
+        )
+        provider = HonchoMemoryProvider()
+        provider._config = cfg
+        provider._recall_mode = "tools"
+        provider._turn_count = 1
+
+        result = provider.prefetch("what is my memory architecture?")
+
+        assert "## Curated Memory Cache" in result
+        assert "Obsidian is the curated memory source" in result
+
+    def test_tools_mode_curated_cache_respects_first_turn_frequency(self, tmp_path):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cache = tmp_path / "cache.md"
+        cache.write_text("compact cache", encoding="utf-8")
+        cfg = HonchoClientConfig(
+            api_key="test-key", enabled=True, recall_mode="tools",
+            injection_frequency="first-turn", raw={"curatedContextPath": str(cache)}, hermes_home=tmp_path,
+        )
+        provider = HonchoMemoryProvider()
+        provider._config = cfg
+        provider._recall_mode = "tools"
+        provider._injection_frequency = "first-turn"
+        provider._turn_count = 2
+
+        assert provider.prefetch("what is my memory architecture?") == ""
+
 
     def test_explicit_peer_name_not_overridden_by_user_id(self):
         """Explicit peerName in config must not be replaced by gateway user_id."""
