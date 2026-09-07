@@ -108,6 +108,9 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                default="false", group="Recall"),
         _field("contextTokens", "Context token cap", KIND_NUMBER, "Cap on auto-injected context tokens. Blank leaves it uncapped.",
                placeholder="(uncapped)", group="Recall"),
+        _field("curatedContextPath", "Curated context path", KIND_TEXT,
+               "Optional local Markdown cache injected instead of raw Honcho context.",
+               aliases=("curatedCachePath",), placeholder="memory/honcho_curated_context.md", group="Recall"),
         # The plugin reads `injection` as one object, so the panel edits the whole block rather than a nested key.
         _field("injection", "Session-start injection", KIND_JSON,
                "Pin which base-context sections the first turn injects: summary, peerRepresentation, peerCard, "
